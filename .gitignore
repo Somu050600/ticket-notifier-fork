@@ -1,0 +1,5 @@
+.env
+data.json
+backend/*.log
+backend/__pycache__/
+*.pyc

@@ -1,0 +1,1123 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>TicketAlert — Availability Notifier</title>
+  <link rel="manifest" href="/manifest.json">
+  <meta name="theme-color" content="#8b5cf6">
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link href="https://fonts.googleapis.com/css2?family=Space+Mono:wght@400;700&family=Syne:wght@400;600;800&display=swap" rel="stylesheet">
+
+  <style>
+    :root {
+      --bg: #fcfaff;
+      --surface: rgba(255, 255, 255, 0.8);
+      --surface2: #f3edff;
+      --border: rgba(120, 87, 187, 0.16);
+      --accent: #7c3aed;
+      --accent2: #a855f7;
+      --green: #00e676;
+      --yellow: #c0841a;
+      --blue: #4f46e5;
+      --text: #1f1638;
+      --muted: #75678f;
+      --font-display: 'Syne', sans-serif;
+      --font-mono: 'Space Mono', monospace;
+    }
+
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+
+    body {
+      background:
+        radial-gradient(circle at top left, rgba(168, 85, 247, 0.18), transparent 30%),
+        radial-gradient(circle at top right, rgba(124, 58, 237, 0.15), transparent 28%),
+        linear-gradient(180deg, #ffffff 0%, #faf5ff 48%, #ffffff 100%);
+      color: var(--text);
+      font-family: var(--font-display);
+      min-height: 100vh;
+      overflow-x: hidden;
+    }
+
+    /* ── Animated grid background ── */
+    body::before {
+      content: '';
+      position: fixed; inset: 0;
+      background-image:
+        linear-gradient(rgba(124,58,237,.06) 1px, transparent 1px),
+        linear-gradient(90deg, rgba(124,58,237,.06) 1px, transparent 1px);
+      background-size: 40px 40px;
+      pointer-events: none;
+      z-index: 0;
+    }
+
+    body::after {
+      content: '';
+      position: fixed;
+      inset: auto -10% -18% auto;
+      width: 420px;
+      height: 420px;
+      background: radial-gradient(circle, rgba(139, 92, 246, 0.22), transparent 68%);
+      filter: blur(18px);
+      pointer-events: none;
+      z-index: 0;
+    }
+
+    /* ── HEADER ── */
+    header {
+      position: relative; z-index: 10;
+      padding: 28px 40px 0;
+      display: flex; align-items: center; justify-content: space-between;
+      border-bottom: 1px solid rgba(124, 58, 237, 0.12);
+      padding-bottom: 24px;
+      backdrop-filter: blur(18px);
+    }
+
+    .logo {
+      display: flex; align-items: center; gap: 12px;
+    }
+
+    .logo-icon {
+      width: 40px; height: 40px;
+      background: linear-gradient(135deg, var(--accent), var(--accent2));
+      border-radius: 10px;
+      display: flex; align-items: center; justify-content: center;
+      font-size: 20px;
+      box-shadow: 0 16px 30px rgba(124,58,237,.28);
+      animation: pulse-glow 2s ease-in-out infinite;
+    }
+
+    @keyframes pulse-glow {
+      0%, 100% { box-shadow: 0 16px 30px rgba(124,58,237,.22); }
+      50%       { box-shadow: 0 18px 42px rgba(124,58,237,.38); }
+    }
+
+    .logo-text {
+      font-size: 22px; font-weight: 800;
+      letter-spacing: -0.5px;
+    }
+
+    .logo-text span { color: var(--accent); }
+
+    .header-right {
+      display: flex; align-items: center; gap: 12px;
+    }
+
+    /* ── PUSH BELL BUTTON ── */
+    #bell-btn {
+      display: flex; align-items: center; gap: 8px;
+      padding: 10px 20px;
+      background: rgba(255, 255, 255, 0.6);
+      border: 1.5px solid var(--border);
+      border-radius: 10px;
+      color: var(--muted);
+      font-family: var(--font-display);
+      font-size: 13px; font-weight: 600;
+      cursor: pointer;
+      transition: all .2s;
+    }
+
+    #bell-btn:hover { border-color: var(--accent); color: var(--text); background: rgba(124,58,237,.08); }
+    #bell-btn.subscribed { border-color: rgba(0,230,118,.28); color: #0f8f50; }
+    #bell-btn.subscribed:hover { background: rgba(0,230,118,.08); }
+
+    #bell-btn .bell { font-size: 16px; }
+
+    /* ── MAIN LAYOUT ── */
+    main {
+      position: relative; z-index: 5;
+      max-width: 960px; margin: 0 auto;
+      padding: 40px 24px 80px;
+    }
+
+    /* ── HERO ── */
+    .hero {
+      text-align: center;
+      margin-bottom: 48px;
+    }
+
+    .hero h1 {
+      font-size: clamp(36px, 6vw, 64px);
+      font-weight: 800;
+      line-height: 1.05;
+      letter-spacing: -2px;
+      margin-bottom: 16px;
+    }
+
+    .hero h1 .accent { color: var(--accent); }
+    .hero h1 .accent2 { color: var(--accent2); }
+
+    .hero p {
+      color: var(--muted);
+      font-size: 16px; max-width: 520px;
+      margin: 0 auto 32px;
+      line-height: 1.6;
+    }
+
+    /* ── STATS BAR ── */
+    .stats-bar {
+      display: flex; justify-content: center; gap: 32px;
+      margin-bottom: 48px;
+      flex-wrap: wrap;
+    }
+
+    .stat {
+      text-align: center;
+    }
+
+    .stat-num {
+      font-family: var(--font-mono);
+      font-size: 28px; font-weight: 700;
+      color: var(--accent);
+      display: block;
+    }
+
+    .stat-label {
+      font-size: 11px; color: var(--muted);
+      text-transform: uppercase; letter-spacing: 1.5px;
+    }
+
+    .stat.green .stat-num { color: var(--green); }
+    .stat.red   .stat-num { color: var(--accent); }
+
+    /* ── ADD WATCHER FORM ── */
+    .add-form {
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: 16px;
+      padding: 28px;
+      margin-bottom: 40px;
+      box-shadow: 0 24px 60px rgba(82, 45, 145, 0.08);
+      backdrop-filter: blur(16px);
+    }
+
+    .add-form h2 {
+      font-size: 16px; font-weight: 700;
+      margin-bottom: 20px;
+      color: var(--text);
+    }
+
+    .form-row {
+      display: grid;
+      grid-template-columns: 1fr 200px 140px;
+      gap: 12px;
+      align-items: end;
+    }
+
+    @media (max-width: 640px) {
+      .form-row { grid-template-columns: 1fr; }
+      header { padding: 20px 16px; }
+      .logo-text { font-size: 18px; }
+    }
+
+    .field label {
+      display: block;
+      font-size: 11px; font-weight: 600;
+      color: var(--muted); text-transform: uppercase;
+      letter-spacing: 1.2px; margin-bottom: 6px;
+    }
+
+    .field input, .field select {
+      width: 100%;
+      background: rgba(255,255,255,.9);
+      border: 1.5px solid var(--border);
+      border-radius: 10px;
+      padding: 12px 14px;
+      color: var(--text);
+      font-family: var(--font-mono);
+      font-size: 13px;
+      outline: none;
+      transition: border-color .2s;
+    }
+
+    .field input:focus, .field select:focus {
+      border-color: var(--accent);
+    }
+
+    .field input::placeholder { color: var(--muted); }
+
+    .btn-add {
+      padding: 12px 24px;
+      background: var(--accent);
+      border: none; border-radius: 10px;
+      color: #fff; font-family: var(--font-display);
+      font-size: 14px; font-weight: 700;
+      cursor: pointer;
+      transition: all .2s;
+      white-space: nowrap;
+    }
+
+    .btn-add:hover { background: #6d28d9; transform: translateY(-1px); }
+    .btn-add:active { transform: translateY(0); }
+    .btn-add:disabled { opacity: .5; cursor: not-allowed; }
+
+    .btn-secondary {
+      padding: 12px 18px;
+      background: rgba(124,58,237,.08);
+      border: 1px solid var(--border);
+      border-radius: 10px;
+      color: var(--text);
+      font-family: var(--font-display);
+      font-size: 14px; font-weight: 700;
+      cursor: pointer;
+      transition: all .2s;
+      white-space: nowrap;
+    }
+
+    .btn-secondary:hover { border-color: var(--accent); background: rgba(124,58,237,.14); }
+
+    .profile-actions {
+      margin-top: 14px;
+      display: flex;
+      gap: 12px;
+      flex-wrap: wrap;
+    }
+
+    .form-hint {
+      margin-top: 12px;
+      font-size: 12px; color: var(--muted);
+    }
+
+    .form-hint a { color: var(--accent); text-decoration: none; }
+
+    .form-error {
+      margin-top: 10px;
+      font-size: 13px; color: var(--accent);
+      display: none;
+    }
+
+    /* ── WATCHERS LIST ── */
+    .watchers-header {
+      display: flex; align-items: center; justify-content: space-between;
+      margin-bottom: 16px;
+    }
+
+    .watchers-header h2 {
+      font-size: 18px; font-weight: 700;
+    }
+
+    .watchers-count {
+      font-family: var(--font-mono);
+      font-size: 12px;
+      background: var(--surface2);
+      border: 1px solid var(--border);
+      border-radius: 20px; padding: 4px 12px;
+      color: var(--muted);
+    }
+
+    .watchers-list {
+      display: flex; flex-direction: column; gap: 12px;
+    }
+
+    /* ── WATCHER CARD ── */
+    .watcher-card {
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: 14px;
+      padding: 20px 24px;
+      display: grid;
+      grid-template-columns: 1fr auto;
+      gap: 16px;
+      align-items: center;
+      transition: border-color .2s, transform .15s;
+      position: relative;
+      overflow: hidden;
+      box-shadow: 0 18px 45px rgba(82, 45, 145, 0.07);
+      backdrop-filter: blur(14px);
+    }
+
+    .watcher-card::before {
+      content: '';
+      position: absolute; left: 0; top: 0; bottom: 0;
+      width: 3px;
+      background: var(--muted);
+      border-radius: 3px 0 0 3px;
+      transition: background .3s;
+    }
+
+    .watcher-card.status-available::before { background: var(--green); }
+    .watcher-card.status-sold_out::before  { background: var(--accent); }
+    .watcher-card.status-upcoming::before  { background: var(--yellow); }
+
+    .watcher-card.status-available {
+      border-color: rgba(0,230,118,.25);
+      background: linear-gradient(135deg, rgba(255,255,255,.95), rgba(0,230,118,.05));
+    }
+
+    .watcher-card:hover { transform: translateY(-2px); border-color: rgba(124,58,237,.28); }
+
+    .watcher-card.paused { opacity: .55; }
+
+    .watcher-info {}
+
+    .watcher-name {
+      font-size: 15px; font-weight: 700;
+      margin-bottom: 6px;
+      display: flex; align-items: center; gap: 8px;
+    }
+
+    .watcher-platform {
+      font-size: 10px; font-weight: 700;
+      text-transform: uppercase; letter-spacing: 1px;
+      padding: 2px 8px;
+      border-radius: 4px;
+      background: var(--surface2);
+      color: var(--muted);
+    }
+
+    .watcher-platform.bookmyshow { background: rgba(220,80,40,.15); color: #f06030; }
+    .watcher-platform.district   { background: rgba(79,70,229,.12); color: var(--blue); }
+
+    .watcher-url {
+      font-family: var(--font-mono);
+      font-size: 11px; color: var(--muted);
+      margin-bottom: 10px;
+      white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+      max-width: 480px;
+    }
+
+    .watcher-meta {
+      display: flex; align-items: center; gap: 16px;
+      flex-wrap: wrap;
+    }
+
+    .status-badge {
+      font-size: 11px; font-weight: 700;
+      padding: 3px 10px; border-radius: 6px;
+      text-transform: uppercase; letter-spacing: .8px;
+    }
+
+    .status-badge.available { background: rgba(0,230,118,.15); color: var(--green); }
+    .status-badge.sold_out  { background: rgba(255,60,60,.15);  color: var(--accent); }
+    .status-badge.upcoming  { background: rgba(255,215,64,.15); color: var(--yellow); }
+    .status-badge.unknown   { background: var(--surface2); color: var(--muted); }
+    .status-badge.error     { background: rgba(255,60,60,.1); color: #ff7777; }
+    .status-badge.checking  { background: var(--surface2); color: var(--muted); animation: blink .8s ease-in-out infinite; }
+
+    @keyframes blink { 0%,100%{opacity:1} 50%{opacity:.4} }
+
+    .watcher-time {
+      font-family: var(--font-mono);
+      font-size: 11px; color: var(--muted);
+    }
+
+    .watcher-price {
+      font-family: var(--font-mono);
+      font-size: 11px; color: var(--yellow);
+    }
+
+    /* ── Card actions ── */
+    .watcher-actions {
+      display: flex; gap: 8px; align-items: center;
+    }
+
+    .icon-btn {
+      width: 34px; height: 34px;
+      background: rgba(255,255,255,.82);
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      color: var(--muted);
+      cursor: pointer;
+      display: flex; align-items: center; justify-content: center;
+      font-size: 15px;
+      transition: all .15s;
+    }
+
+    .icon-btn:hover { border-color: var(--accent); color: var(--text); background: rgba(124,58,237,.09); }
+    .icon-btn.pause:hover { border-color: var(--yellow); color: var(--yellow); background: rgba(255,215,64,.08); }
+    .icon-btn.delete:hover { border-color: var(--accent); color: var(--accent); }
+
+    /* ── EMPTY STATE ── */
+    .empty-state {
+      text-align: center; padding: 64px 24px;
+      color: var(--muted);
+    }
+
+    .empty-icon { font-size: 48px; margin-bottom: 16px; }
+    .empty-state p { font-size: 15px; }
+
+    /* ── AVAILABLE ALERT BANNER ── */
+    .alert-banner {
+      position: fixed; bottom: 24px; right: 24px;
+      background: linear-gradient(135deg, #002b1a, #003822);
+      border: 1.5px solid var(--green);
+      border-radius: 14px; padding: 16px 20px;
+      max-width: 360px; z-index: 1000;
+      box-shadow: 0 8px 32px rgba(0,230,118,.25);
+      display: none;
+      animation: slide-in .3s ease-out;
+    }
+
+    @keyframes slide-in {
+      from { transform: translateY(20px); opacity: 0; }
+      to   { transform: translateY(0); opacity: 1; }
+    }
+
+    .alert-banner.show { display: block; }
+
+    .alert-title {
+      font-size: 14px; font-weight: 700; color: var(--green);
+      margin-bottom: 6px;
+    }
+
+    .alert-body { font-size: 13px; color: #aaffcc; margin-bottom: 12px; }
+
+    .alert-actions { display: flex; gap: 8px; }
+
+    .alert-btn {
+      padding: 7px 16px; border-radius: 8px;
+      font-size: 13px; font-weight: 600;
+      cursor: pointer; border: none;
+    }
+
+    .alert-btn.primary { background: var(--green); color: #001a0d; }
+    .alert-btn.secondary { background: transparent; color: var(--muted); border: 1px solid var(--border); }
+
+    /* ── HOW IT WORKS ── */
+    .how-section {
+      margin-top: 64px;
+      border-top: 1px solid var(--border);
+      padding-top: 48px;
+    }
+
+    .how-section h2 {
+      font-size: 22px; font-weight: 800;
+      margin-bottom: 32px; text-align: center;
+    }
+
+    .steps {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
+      gap: 20px;
+    }
+
+    .step {
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: 14px;
+      padding: 24px;
+      text-align: center;
+      box-shadow: 0 18px 45px rgba(82, 45, 145, 0.06);
+      backdrop-filter: blur(12px);
+    }
+
+    .step-num {
+      width: 36px; height: 36px;
+      background: linear-gradient(135deg, var(--accent), var(--accent2));
+      border-radius: 50%;
+      display: flex; align-items: center; justify-content: center;
+      font-family: var(--font-mono);
+      font-size: 14px; font-weight: 700;
+      margin: 0 auto 14px;
+    }
+
+    .step h3 { font-size: 14px; font-weight: 700; margin-bottom: 8px; }
+    .step p  { font-size: 12px; color: var(--muted); line-height: 1.6; }
+
+    /* ── TOAST ── */
+    #toast {
+      position: fixed; top: 24px; left: 50%;
+      transform: translateX(-50%) translateY(-80px);
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: 10px; padding: 12px 20px;
+      font-size: 13px; color: var(--text);
+      z-index: 9999;
+      transition: transform .3s cubic-bezier(.34,1.56,.64,1);
+      white-space: nowrap;
+    }
+
+    #toast.show { transform: translateX(-50%) translateY(0); }
+    #toast.success { border-color: var(--green); color: var(--green); }
+    #toast.error   { border-color: var(--accent); color: var(--accent); }
+  </style>
+</head>
+<body>
+
+  <header>
+    <div class="logo">
+      <div class="logo-icon">🔔</div>
+      <div class="logo-text">Ticket<span>Alert</span></div>
+    </div>
+    <div class="header-right">
+      <button id="bell-btn" onclick="toggleNotifications()">
+        <span class="bell">🔕</span>
+        <span id="bell-label">Enable Alerts</span>
+      </button>
+    </div>
+  </header>
+
+  <main>
+    <div class="hero">
+      <h1>
+        Get <span class="accent">alarm</span> alerts<br>
+        when tickets go <span class="accent2">live</span>
+      </h1>
+      <p>
+        Paste any BookMyShow or District event URL.
+        We'll watch it 24/7 and blast an alarm notification straight to your phone the moment tickets become available.
+      </p>
+    </div>
+
+    <!-- Stats -->
+    <div class="stats-bar" id="stats-bar">
+      <div class="stat">
+        <span class="stat-num" id="stat-total">0</span>
+        <span class="stat-label">Watching</span>
+      </div>
+      <div class="stat green">
+        <span class="stat-num" id="stat-available">0</span>
+        <span class="stat-label">Available</span>
+      </div>
+      <div class="stat red">
+        <span class="stat-num" id="stat-sold">0</span>
+        <span class="stat-label">Sold Out</span>
+      </div>
+      <div class="stat">
+        <span class="stat-num" id="stat-subs">0</span>
+        <span class="stat-label">Subscribers</span>
+      </div>
+    </div>
+
+    <!-- Add Form -->
+    <div class="add-form">
+      <h2>+ Add Event to Watch</h2>
+      <div class="form-row">
+        <div class="field">
+          <label>Event URL (BookMyShow or District)</label>
+          <input type="url" id="input-url" placeholder="https://in.bookmyshow.com/events/...">
+        </div>
+        <div class="field">
+          <label>Event Name (optional)</label>
+          <input type="text" id="input-name" placeholder="Auto-detected">
+        </div>
+        <div class="field">
+          <label>Check Every</label>
+          <select id="input-interval">
+            <option value="15" selected>15 seconds</option>
+            <option value="30">30 seconds</option>
+            <option value="60">1 minute</option>
+            <option value="120">2 minutes</option>
+            <option value="300">5 minutes</option>
+          </select>
+        </div>
+      </div>
+      <div class="form-row" style="grid-template-columns: 1fr; margin-top: 12px;">
+        <div class="field">
+          <label>Fast Checkout URL (optional)</label>
+          <input type="url" id="input-checkout-url" placeholder="https://in.bookmyshow.com/buytickets/...">
+        </div>
+      </div>
+      <div style="margin-top:14px;">
+        <button class="btn-add" onclick="addWatcher()">Start Watching →</button>
+      </div>
+      <div class="form-error" id="form-error"></div>
+      <p class="form-hint">
+        Supports <a href="https://in.bookmyshow.com" target="_blank">BookMyShow</a> &amp;
+        <a href="https://www.district.in" target="_blank">District.in</a> event pages.
+        First scan starts immediately, then checks continue as fast as every 15 seconds.
+      </p>
+    </div>
+
+    <div class="add-form">
+      <h2>Checkout Ready Profile</h2>
+      <div class="form-row">
+        <div class="field">
+          <label>Name</label>
+          <input type="text" id="profile-name" placeholder="Your full name">
+        </div>
+        <div class="field">
+          <label>Email</label>
+          <input type="email" id="profile-email" placeholder="you@example.com">
+        </div>
+        <div class="field">
+          <label>Phone</label>
+          <input type="tel" id="profile-phone" placeholder="+91...">
+        </div>
+      </div>
+      <div class="profile-actions">
+        <button class="btn-secondary" onclick="saveCheckoutProfile()">Save On This Device</button>
+        <button class="btn-secondary" onclick="copyCheckoutProfile()">Copy Profile</button>
+      </div>
+      <p class="form-hint">
+        Saved only in this browser to help you move quickly at checkout.
+        Card details are not stored here, so use browser-saved payment methods and complete OTP manually.
+      </p>
+    </div>
+
+    <!-- Watchers -->
+    <div class="watchers-header">
+      <h2>Watched Events</h2>
+      <span class="watchers-count" id="watchers-count">0 events</span>
+    </div>
+
+    <div class="watchers-list" id="watchers-list">
+      <div class="empty-state" id="empty-state">
+        <div class="empty-icon">🎫</div>
+        <p>No events being watched yet.<br>Add a URL above to get started.</p>
+      </div>
+    </div>
+
+    <!-- How It Works -->
+    <div class="how-section">
+      <h2>How It Works</h2>
+      <div class="steps">
+        <div class="step">
+          <div class="step-num">1</div>
+          <h3>Enable Alerts</h3>
+          <p>Click "Enable Alerts" or allow the prompt when you add your first watch. Works on phones too.</p>
+        </div>
+        <div class="step">
+          <div class="step-num">2</div>
+          <h3>Paste URL</h3>
+          <p>Copy any BookMyShow or District event page URL and paste it above.</p>
+        </div>
+        <div class="step">
+          <div class="step-num">3</div>
+          <h3>We Watch 24/7</h3>
+          <p>Our server runs the first scan immediately, then keeps checking in near real time even when your phone is off.</p>
+        </div>
+        <div class="step">
+          <div class="step-num">4</div>
+          <h3>ALARM!</h3>
+          <p>The moment tickets drop, your phone rings with a loud alarm notification.</p>
+        </div>
+      </div>
+    </div>
+  </main>
+
+  <!-- Alert Banner (for SW messages) -->
+  <div class="alert-banner" id="alert-banner">
+    <div class="alert-title">🟢 TICKETS AVAILABLE!</div>
+    <div class="alert-body" id="alert-body">Tickets found for an event you're watching!</div>
+    <div class="alert-actions">
+      <button class="alert-btn primary" id="alert-open-btn">Open Page</button>
+      <button class="alert-btn secondary" onclick="closeAlert()">Dismiss</button>
+    </div>
+  </div>
+
+  <div id="toast"></div>
+
+  <script>
+  const VAPID_PUBLIC_KEY = "{{ vapid_public_key }}";
+  const PROFILE_STORAGE_KEY = 'ticketalert.checkoutProfile';
+
+  // ── Utilities ───────────────────────────────────────────────────────────────
+  function urlB64ToUint8Array(base64String) {
+    const padding = '='.repeat((4 - base64String.length % 4) % 4);
+    const base64 = (base64String + padding).replace(/-/g, '+').replace(/_/g, '/');
+    const rawData = atob(base64);
+    return Uint8Array.from([...rawData].map(c => c.charCodeAt(0)));
+  }
+
+  function showToast(msg, type = '') {
+    const t = document.getElementById('toast');
+    t.textContent = msg;
+    t.className = 'show ' + type;
+    setTimeout(() => t.className = '', 3000);
+  }
+
+  function showError(msg) {
+    const el = document.getElementById('form-error');
+    el.textContent = msg; el.style.display = 'block';
+    setTimeout(() => el.style.display = 'none', 4000);
+  }
+
+  // ── Service Worker & Push ───────────────────────────────────────────────────
+  let swReg = null;
+  let currentSubscription = null;
+  let swInitPromise = null;
+
+  async function initSW() {
+    if (swInitPromise) return swInitPromise;
+    if (!('serviceWorker' in navigator) || !('PushManager' in window)) return null;
+
+    swInitPromise = (async () => {
+      try {
+        swReg = await navigator.serviceWorker.register('/sw.js');
+        currentSubscription = await swReg.pushManager.getSubscription();
+        updateBellUI();
+      } catch (e) {
+        console.warn('SW registration failed:', e);
+      }
+
+      navigator.serviceWorker.addEventListener('message', (event) => {
+        if (event.data?.type === 'TICKET_AVAILABLE') {
+          showAlertBanner(event.data.url, 'Tickets are available!');
+        }
+      });
+
+      return swReg;
+    })();
+
+    return swInitPromise;
+  }
+
+  function updateBellUI() {
+    const btn   = document.getElementById('bell-btn');
+    const label = document.getElementById('bell-label');
+    const bell  = btn.querySelector('.bell');
+    if (currentSubscription) {
+      btn.classList.add('subscribed');
+      bell.textContent = '🔔';
+      label.textContent = 'Alerts ON';
+    } else {
+      btn.classList.remove('subscribed');
+      bell.textContent = '🔕';
+      label.textContent = 'Enable Alerts';
+    }
+  }
+
+  async function enableNotifications(interactive = true) {
+    await initSW();
+
+    if (!swReg) {
+      showToast('Push not supported on this browser', 'error');
+      return false;
+    }
+
+    if (!VAPID_PUBLIC_KEY) {
+      showToast('Notifications are not configured yet on this deployment', 'error');
+      return false;
+    }
+
+    if (currentSubscription) return true;
+
+    let permission = Notification.permission;
+    if (permission !== 'granted' && interactive) {
+      permission = await Notification.requestPermission();
+    }
+    if (permission !== 'granted') {
+      if (permission === 'denied') {
+        showToast('Notifications are blocked in browser settings', 'error');
+      }
+      return false;
+    }
+
+    try {
+      const existing = await swReg.pushManager.getSubscription();
+      const sub = existing || await swReg.pushManager.subscribe({
+        userVisibleOnly: true,
+        applicationServerKey: urlB64ToUint8Array(VAPID_PUBLIC_KEY)
+      });
+      await fetch('/api/subscribe', {
+        method: 'POST',
+        headers: {'Content-Type':'application/json'},
+        body: JSON.stringify(sub)
+      });
+      currentSubscription = sub;
+      updateBellUI();
+      showToast('Alerts enabled!', 'success');
+      setTimeout(() => sendTestNotification(), 1500);
+      return true;
+    } catch (e) {
+      console.error(e);
+      showToast('Failed to enable alerts: ' + e.message, 'error');
+      return false;
+    }
+  }
+
+  async function toggleNotifications() {
+    await initSW();
+
+    if (!swReg) {
+      showToast('Push not supported on this browser', 'error'); return;
+    }
+
+    if (currentSubscription) {
+      // Unsubscribe
+      await currentSubscription.unsubscribe();
+      await fetch('/api/unsubscribe', {
+        method: 'POST',
+        headers: {'Content-Type':'application/json'},
+        body: JSON.stringify({ endpoint: currentSubscription.endpoint })
+      });
+      currentSubscription = null;
+      updateBellUI();
+      showToast('Alerts disabled');
+      return;
+    }
+
+    await enableNotifications(true);
+  }
+
+  async function sendTestNotification() {
+    if (!currentSubscription) return;
+    try {
+      await fetch('/api/test-notification', {
+        method: 'POST',
+        headers: {'Content-Type':'application/json'},
+        body: JSON.stringify({ subscription: currentSubscription })
+      });
+    } catch(e) {}
+  }
+
+  // ── Watchers ────────────────────────────────────────────────────────────────
+  let watchers = [];
+
+  async function loadWatchers() {
+    const res = await fetch('/api/watchers');
+    watchers = await res.json();
+    renderWatchers();
+  }
+
+  async function loadStats() {
+    const res = await fetch('/api/stats');
+    const s = await res.json();
+    document.getElementById('stat-total').textContent     = s.total;
+    document.getElementById('stat-available').textContent = s.available;
+    document.getElementById('stat-sold').textContent      = s.sold_out;
+    document.getElementById('stat-subs').textContent      = s.subscribers;
+  }
+
+  function renderWatchers() {
+    const list  = document.getElementById('watchers-list');
+    const empty = document.getElementById('empty-state');
+    const count = document.getElementById('watchers-count');
+
+    count.textContent = watchers.length + ' event' + (watchers.length !== 1 ? 's' : '');
+
+    if (watchers.length === 0) {
+      empty.style.display = 'block';
+      list.innerHTML = '';
+      list.appendChild(empty);
+      return;
+    }
+
+    empty.style.display = 'none';
+    list.innerHTML = watchers.map(w => cardHTML(w)).join('');
+  }
+
+  function cardHTML(w) {
+    const status   = w.last_status || 'checking';
+    const platform = w.platform || 'bookmyshow';
+    const targetUrl = w.checkout_url || w.url;
+    const platformName = {
+      bookmyshow: 'BookMyShow',
+      district: 'District',
+      insider: 'Insider',
+      paytm: 'Paytm',
+      zomato: 'Zomato',
+      ticketnew: 'TicketNew',
+      kyazoonga: 'Kyazoonga',
+    }[platform] || platform;
+    const badgeTxt = {
+      available: '✅ Available',
+      sold_out:  '❌ Sold Out',
+      upcoming:  '⏰ Upcoming',
+      checking:  '⏳ Checking…',
+      unknown:   '❓ Unknown',
+      error:     '⚠ Error',
+    }[status] || status;
+
+    return `
+    <div class="watcher-card status-${status} ${w.paused ? 'paused' : ''}" id="card-${w.id}">
+      <div class="watcher-info">
+        <div class="watcher-name">
+          ${escHtml(w.name)}
+          <span class="watcher-platform ${platform}">${escHtml(platformName)}</span>
+        </div>
+        <div class="watcher-url">${escHtml(targetUrl)}</div>
+        <div class="watcher-meta">
+          <span class="status-badge ${status}">${badgeTxt}</span>
+          ${w.last_checked ? `<span class="watcher-time">Checked ${escHtml(w.last_checked)}</span>` : ''}
+          ${w.price ? `<span class="watcher-price">${escHtml(w.price)}</span>` : ''}
+          ${w.paused ? '<span class="status-badge unknown">PAUSED</span>' : ''}
+        </div>
+      </div>
+      <div class="watcher-actions">
+        <button class="icon-btn" title="Check now" onclick="checkNow('${w.id}')">⚡</button>
+        <button class="icon-btn pause" title="${w.paused ? 'Resume' : 'Pause'}" onclick="togglePause('${w.id}')">
+          ${w.paused ? '▶' : '⏸'}
+        </button>
+        <a href="${escHtml(targetUrl)}" target="_blank" class="icon-btn" title="${w.checkout_url ? 'Open checkout' : 'Open page'}">↗</a>
+        <button class="icon-btn delete" title="Remove" onclick="removeWatcher('${w.id}')">✕</button>
+      </div>
+    </div>`;
+  }
+
+  function escHtml(s) {
+    return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');
+  }
+
+  function loadCheckoutProfile() {
+    try {
+      const raw = localStorage.getItem(PROFILE_STORAGE_KEY);
+      const profile = raw ? JSON.parse(raw) : {};
+      document.getElementById('profile-name').value = profile.name || '';
+      document.getElementById('profile-email').value = profile.email || '';
+      document.getElementById('profile-phone').value = profile.phone || '';
+    } catch (e) {
+      console.warn('Profile load failed:', e);
+    }
+  }
+
+  function getCheckoutProfile() {
+    return {
+      name: document.getElementById('profile-name').value.trim(),
+      email: document.getElementById('profile-email').value.trim(),
+      phone: document.getElementById('profile-phone').value.trim(),
+    };
+  }
+
+  function saveCheckoutProfile() {
+    try {
+      localStorage.setItem(PROFILE_STORAGE_KEY, JSON.stringify(getCheckoutProfile()));
+      showToast('Checkout profile saved on this device', 'success');
+    } catch (e) {
+      showToast('Could not save profile locally', 'error');
+    }
+  }
+
+  async function copyCheckoutProfile() {
+    const profile = getCheckoutProfile();
+    const lines = [
+      profile.name && `Name: ${profile.name}`,
+      profile.email && `Email: ${profile.email}`,
+      profile.phone && `Phone: ${profile.phone}`,
+    ].filter(Boolean);
+
+    if (!lines.length) {
+      showToast('Add profile details first', 'error');
+      return;
+    }
+
+    try {
+      await navigator.clipboard.writeText(lines.join('\n'));
+      showToast('Profile copied for quick checkout', 'success');
+    } catch (e) {
+      showToast('Clipboard access failed', 'error');
+    }
+  }
+
+  async function addWatcher() {
+    const url      = document.getElementById('input-url').value.trim();
+    const checkoutUrl = document.getElementById('input-checkout-url').value.trim();
+    const name     = document.getElementById('input-name').value.trim();
+    const interval = parseInt(document.getElementById('input-interval').value);
+    const btn      = document.querySelector('.btn-add');
+
+    if (!url) { showError('Please enter an event URL'); return; }
+
+    btn.disabled = true; btn.textContent = 'Adding…';
+
+    try {
+      if (!currentSubscription && Notification.permission !== 'denied') {
+        await enableNotifications(true);
+      }
+
+      const res = await fetch('/api/watchers', {
+        method: 'POST',
+        headers: {'Content-Type':'application/json'},
+        body: JSON.stringify({ url, checkout_url: checkoutUrl, name, interval_seconds: interval })
+      });
+      const data = await res.json();
+      if (!res.ok) { showError(data.error || 'Failed to add'); return; }
+
+      document.getElementById('input-url').value  = '';
+      document.getElementById('input-checkout-url').value = '';
+      document.getElementById('input-name').value = '';
+      showToast('✅ Now watching! First scan running…', 'success');
+      await loadWatchers();
+      await loadStats();
+      await checkNow(data.id, { silent: true });
+    } catch (e) {
+      showError('Network error: ' + e.message);
+    } finally {
+      btn.disabled = false; btn.textContent = 'Start Watching →';
+    }
+  }
+
+  async function removeWatcher(id) {
+    if (!confirm('Remove this watcher?')) return;
+    await fetch(`/api/watchers/${id}`, { method: 'DELETE' });
+    await loadWatchers();
+    await loadStats();
+    showToast('Removed');
+  }
+
+  async function togglePause(id) {
+    const res  = await fetch(`/api/watchers/${id}/pause`, { method: 'POST' });
+    const data = await res.json();
+    showToast(data.paused ? '⏸ Paused' : '▶ Resumed');
+    await loadWatchers();
+  }
+
+  async function checkNow(id, { silent = false } = {}) {
+    const card = document.getElementById(`card-${id}`);
+    if (card) card.style.opacity = '0.6';
+    if (!silent) showToast('Checking now…');
+    try {
+      const res  = await fetch(`/api/watchers/${id}/check-now`, { method: 'POST' });
+      const data = await res.json();
+      // Update just this card
+      watchers = watchers.map(w => w.id === id ? data : w);
+      renderWatchers();
+      await loadStats();
+
+      if (data.last_status === 'available') {
+        showAlertBanner(data.checkout_url || data.url, `${data.name} — Checkout is ready. Complete OTP manually.`);
+        showToast('🎫 TICKETS AVAILABLE!', 'success');
+      } else if (!silent) {
+        showToast('Status: ' + (data.last_status || 'unknown'));
+      }
+    } catch(e) {
+      if (!silent) showToast('Check failed', 'error');
+      if (card) card.style.opacity = '1';
+    }
+  }
+
+  // ── Alert banner ────────────────────────────────────────────────────────────
+  function showAlertBanner(url, msg) {
+    document.getElementById('alert-body').textContent   = msg;
+    document.getElementById('alert-open-btn').onclick   = () => window.open(url, '_blank');
+    document.getElementById('alert-banner').classList.add('show');
+
+    // Play alarm sound via AudioContext
+    playAlarmSound();
+
+    setTimeout(() => closeAlert(), 30000);
+  }
+
+  function closeAlert() {
+    document.getElementById('alert-banner').classList.remove('show');
+  }
+
+  function playAlarmSound() {
+    try {
+      const ctx  = new (window.AudioContext || window.webkitAudioContext)();
+      const alarm = [880, 1100, 880, 1100, 880, 1320, 880];
+      let   t    = ctx.currentTime;
+      alarm.forEach(freq => {
+        const osc  = ctx.createOscillator();
+        const gain = ctx.createGain();
+        osc.connect(gain); gain.connect(ctx.destination);
+        osc.frequency.value = freq;
+        osc.type = 'square';
+        gain.gain.setValueAtTime(0.3, t);
+        gain.gain.exponentialRampToValueAtTime(0.001, t + 0.18);
+        osc.start(t); osc.stop(t + 0.18);
+        t += 0.22;
+      });
+    } catch(e) {}
+  }
+
+  // ── Enter key on URL input ──────────────────────────────────────────────────
+  document.getElementById('input-url').addEventListener('keydown', e => {
+    if (e.key === 'Enter') addWatcher();
+  });
+
+  // ── Poll for updates ────────────────────────────────────────────────────────
+  async function poll() {
+    await loadWatchers();
+    await loadStats();
+  }
+
+  // ── Init ─────────────────────────────────────────────────────────────────────
+  loadCheckoutProfile();
+  initSW();
+  poll();
+  setInterval(poll, 5000); // refresh UI every 5s
+  </script>
+</body>
+</html>
