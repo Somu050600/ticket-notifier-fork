@@ -5,11 +5,14 @@ Flask backend with Web Push notifications for BookMyShow & District
 
 import json
 import os
+import smtplib
 import threading
 import time
 import logging
 import uuid
 from datetime import datetime
+from email.mime.multipart import MIMEMultipart
+from email.mime.text import MIMEText
 from pathlib import Path
 
 from flask import Flask, request, jsonify, render_template, send_from_directory
@@ -41,6 +44,56 @@ CORS(app)
 VAPID_PRIVATE_KEY = os.environ.get("VAPID_PRIVATE_KEY", "")
 VAPID_PUBLIC_KEY  = os.environ.get("VAPID_PUBLIC_KEY", "")
 VAPID_CLAIMS      = {"sub": f"mailto:{os.environ.get('CONTACT_EMAIL', 'alerts@ticketalert.app')}"}
+
+# ── Direct alert config ───────────────────────────────────────────────────────
+ALERT_PHONE  = os.environ.get("ALERT_PHONE",  "+918368272979")   # Twilio SMS target
+ALERT_EMAIL  = os.environ.get("ALERT_EMAIL",  "rahulgulati712@gmail.com")
+
+# Twilio (set these in Railway env vars)
+TWILIO_SID   = os.environ.get("TWILIO_ACCOUNT_SID", "")
+TWILIO_TOKEN = os.environ.get("TWILIO_AUTH_TOKEN",  "")
+TWILIO_FROM  = os.environ.get("TWILIO_FROM_NUMBER", "")   # e.g. +1XXXXXXXXXX
+
+# SMTP / Gmail (set these in Railway env vars)
+SMTP_HOST    = os.environ.get("SMTP_HOST",     "smtp.gmail.com")
+SMTP_PORT    = int(os.environ.get("SMTP_PORT", "587"))
+SMTP_USER    = os.environ.get("SMTP_USER",     "")        # your Gmail address
+SMTP_PASS    = os.environ.get("SMTP_PASS",     "")        # Gmail App Password
+
+
+def send_sms_alert(message: str):
+    """Send an SMS via Twilio to ALERT_PHONE."""
+    if not all([TWILIO_SID, TWILIO_TOKEN, TWILIO_FROM]):
+        logger.warning("Twilio credentials not set — skipping SMS alert")
+        return
+    try:
+        from twilio.rest import Client
+        client = Client(TWILIO_SID, TWILIO_TOKEN)
+        client.messages.create(body=message, from_=TWILIO_FROM, to=ALERT_PHONE)
+        logger.info(f"SMS sent to {ALERT_PHONE}")
+    except Exception as e:
+        logger.error(f"SMS failed: {e}")
+
+
+def send_email_alert(subject: str, body: str):
+    """Send an email via SMTP to ALERT_EMAIL."""
+    if not all([SMTP_USER, SMTP_PASS]):
+        logger.warning("SMTP credentials not set — skipping email alert")
+        return
+    try:
+        msg = MIMEMultipart("alternative")
+        msg["Subject"] = subject
+        msg["From"]    = SMTP_USER
+        msg["To"]      = ALERT_EMAIL
+        msg.attach(MIMEText(body, "plain"))
+        with smtplib.SMTP(SMTP_HOST, SMTP_PORT) as server:
+            server.ehlo()
+            server.starttls()
+            server.login(SMTP_USER, SMTP_PASS)
+            server.sendmail(SMTP_USER, ALERT_EMAIL, msg.as_string())
+        logger.info(f"Email sent to {ALERT_EMAIL}")
+    except Exception as e:
+        logger.error(f"Email failed: {e}")
 
 DATABASE_URL = os.environ.get("DATABASE_URL", "")
 
@@ -141,8 +194,6 @@ def send_push(subscription_info, payload):
 def notify_all(watcher, status):
     data = load_data()
     subs = data.get("subscriptions", [])
-    if not subs:
-        return
     target_url = watcher.get("checkout_url") or watcher["url"]
 
     if status == "available":
@@ -156,6 +207,14 @@ def notify_all(watcher, status):
             "requireInteraction": True,
             "tag": f"available-{watcher['id']}",
         }
+        sms_msg   = f"🎫 TICKETS AVAILABLE: {watcher['name']}\nBook now: {target_url}"
+        email_sub = f"🎫 Tickets Available — {watcher['name']}"
+        email_body = (
+            f"Tickets are NOW AVAILABLE for:\n\n"
+            f"  {watcher['name']}\n\n"
+            f"Book here: {target_url}\n\n"
+            f"— TicketAlert"
+        )
     elif status == "upcoming":
         payload = {
             "type": "UPCOMING",
@@ -165,9 +224,22 @@ def notify_all(watcher, status):
             "alarm": False,
             "tag": f"upcoming-{watcher['id']}",
         }
+        sms_msg   = f"⏰ Sale opening soon: {watcher['name']}\n{target_url}"
+        email_sub = f"⏰ Sale Opening Soon — {watcher['name']}"
+        email_body = (
+            f"Ticket sale is about to begin for:\n\n"
+            f"  {watcher['name']}\n\n"
+            f"Link: {target_url}\n\n"
+            f"— TicketAlert"
+        )
     else:
         return
 
+    # ── Direct alerts (SMS + Email) ───────────────────────────────────────────
+    threading.Thread(target=send_sms_alert,   args=(sms_msg,),            daemon=True).start()
+    threading.Thread(target=send_email_alert, args=(email_sub, email_body), daemon=True).start()
+
+    # ── Web push (browser notifications) ─────────────────────────────────────
     stale = []
     for sub in subs:
         result = send_push(sub, payload)
