@@ -60,6 +60,22 @@ MOBILE_VIEWPORTS = [
     {"width": 360,  "height": 780},   # Galaxy S21
 ]
 
+# ── Proxy rotation (Bright Data residential) ─────────────────────────────────
+# Replace CUSTOMER_ID and PASSWORD with your Bright Data credentials.
+# Each entry uses a different session ID so each request rotates the exit IP.
+_BRD_HOST = "brd.superproxy.io:22225"
+_BRD_USER = "brd-customer-CUSTOMER_ID-zone-residential"
+_BRD_PASS = "PASSWORD"
+
+proxies_list = [
+    f"http://{_BRD_USER}-session-{i}:{_BRD_PASS}@{_BRD_HOST}"
+    for i in range(1, 11)          # 10 pre-seeded session IDs
+]
+
+def get_random_proxy():
+    proxy = random.choice(proxies_list)
+    return {"http": proxy, "https": proxy}
+
 
 def pick_ua_and_viewport():
     ua = random.choice(USER_AGENTS)
@@ -232,11 +248,40 @@ def _fetch_with_requests(url: str) -> Optional[str]:
     # Throttle: random pause before request (1 – 3 s)
     time.sleep(random.uniform(1.0, 3.0))
     try:
-        resp = requests.get(url, headers=headers, timeout=15, allow_redirects=True)
+        resp = requests.get(url, headers=headers, timeout=15, allow_redirects=True,
+                            proxies=get_random_proxy() if proxies_list else None)
         resp.raise_for_status()
         return resp.text
     except Exception as e:
         logger.error(f"Requests error on {url}: {e}")
+        return None
+
+
+# ── CAPTCHA solving ───────────────────────────────────────────────────────────
+
+def solve_recaptcha(site_key: str, page_url: str, api_key: str = "") -> Optional[str]:
+    """Submit a reCAPTCHA to 2captcha and poll for the token."""
+    submit = requests.post("https://2captcha.com/in.php", data={
+        "key": api_key,
+        "method": "userrecaptcha",
+        "googlekey": site_key,
+        "pageurl": page_url,
+    })
+    try:
+        task_id = submit.text.split("|")[1]
+    except IndexError:
+        logger.error(f"2captcha submission failed: {submit.text}")
+        return None
+
+    time.sleep(15)
+    result = requests.get(
+        f"https://2captcha.com/res.php",
+        params={"key": api_key, "action": "get", "id": task_id},
+    )
+    try:
+        return result.text.split("|")[1]
+    except IndexError:
+        logger.error(f"2captcha result failed: {result.text}")
         return None
 
 
