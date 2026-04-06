@@ -1,8 +1,6 @@
 [build]
 builder = "NIXPACKS"
-
-[build.buildCommand]
-value = "pip install -r requirements.txt && playwright install chromium && playwright install-deps chromium"
+buildCommand = "pip install -r requirements.txt && playwright install chromium && playwright install-deps chromium"
 
 [deploy]
 startCommand = "gunicorn -c backend/gunicorn_config.py backend.app:app"
