@@ -594,11 +594,11 @@
         <div class="field">
           <label>Check Every</label>
           <select id="input-interval">
-            <option value="15" selected>15 seconds</option>
+            <option value="5" selected>5 seconds</option>
+            <option value="10">10 seconds</option>
+            <option value="15">15 seconds</option>
             <option value="30">30 seconds</option>
             <option value="60">1 minute</option>
-            <option value="120">2 minutes</option>
-            <option value="300">5 minutes</option>
           </select>
         </div>
       </div>
@@ -1081,25 +1081,47 @@
 
   function closeAlert() {
     document.getElementById('alert-banner').classList.remove('show');
+    stopAlarmSound();
   }
 
+  // ── LOUD repeating alarm ──────────────────────────────────────────────────
+  let _alarmInterval = null;
+  let _alarmCtx      = null;
+
   function playAlarmSound() {
+    // Stop any existing alarm first
+    stopAlarmSound();
+
     try {
-      const ctx  = new (window.AudioContext || window.webkitAudioContext)();
-      const alarm = [880, 1100, 880, 1100, 880, 1320, 880];
-      let   t    = ctx.currentTime;
-      alarm.forEach(freq => {
-        const osc  = ctx.createOscillator();
-        const gain = ctx.createGain();
-        osc.connect(gain); gain.connect(ctx.destination);
+      _alarmCtx = new (window.AudioContext || window.webkitAudioContext)();
+    } catch(e) { return; }
+
+    function playBurst() {
+      if (!_alarmCtx) return;
+      const freqs = [880, 1100, 880, 1100, 880, 1320, 880, 1320, 1100, 880];
+      let t = _alarmCtx.currentTime;
+      freqs.forEach(freq => {
+        const osc  = _alarmCtx.createOscillator();
+        const gain = _alarmCtx.createGain();
+        osc.connect(gain); gain.connect(_alarmCtx.destination);
         osc.frequency.value = freq;
         osc.type = 'square';
-        gain.gain.setValueAtTime(0.3, t);
-        gain.gain.exponentialRampToValueAtTime(0.001, t + 0.18);
-        osc.start(t); osc.stop(t + 0.18);
-        t += 0.22;
+        gain.gain.setValueAtTime(1.0, t);  // FULL volume
+        gain.gain.exponentialRampToValueAtTime(0.01, t + 0.25);
+        osc.start(t); osc.stop(t + 0.25);
+        t += 0.3;
       });
-    } catch(e) {}
+    }
+
+    // Play immediately, then repeat every 4 seconds for 2 minutes
+    playBurst();
+    _alarmInterval = setInterval(playBurst, 4000);
+    setTimeout(stopAlarmSound, 120000); // auto-stop after 2 min
+  }
+
+  function stopAlarmSound() {
+    if (_alarmInterval) { clearInterval(_alarmInterval); _alarmInterval = null; }
+    if (_alarmCtx) { _alarmCtx.close().catch(()=>{}); _alarmCtx = null; }
   }
 
   // ── Enter key on URL input ──────────────────────────────────────────────────
@@ -1107,10 +1129,30 @@
     if (e.key === 'Enter') addWatcher();
   });
 
-  // ── Poll for updates ────────────────────────────────────────────────────────
+  // ── Poll for updates + auto-trigger alarm on available ──────────────────────
+  let _prevStatuses = {};   // track previous status per watcher id
+  let _alarmActive  = false;
+
   async function poll() {
     await loadWatchers();
     await loadStats();
+
+    // Check each watcher — if it just became "available", ALARM!
+    for (const w of watchers) {
+      const prev = _prevStatuses[w.id];
+      if (w.last_status === 'available') {
+        // Fire alarm if status changed OR first time seeing this watcher as available
+        if (prev !== 'available' && !_alarmActive) {
+          _alarmActive = true;
+          const url = w.checkout_url || w.url;
+          showAlertBanner(url, `${w.name} — TICKETS AVAILABLE! Go go go!`);
+          showToast('🎫 TICKETS AVAILABLE!', 'success');
+          // Auto-stop alarm flag after 2 minutes so it can re-trigger
+          setTimeout(() => { _alarmActive = false; }, 120000);
+        }
+      }
+      _prevStatuses[w.id] = w.last_status;
+    }
   }
 
   // ── Init ─────────────────────────────────────────────────────────────────────
