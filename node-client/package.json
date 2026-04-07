@@ -5,9 +5,11 @@
   "main": "src/ticketAlert.js",
   "type": "module",
   "scripts": {
-    "start": "node src/ticketAlert.js"
+    "start": "node src/ticketAlert.js",
+    "automate": "node src/automation/checkout.js"
   },
   "dependencies": {
-    "axios": "^1.7.2"
+    "axios": "^1.7.2",
+    "playwright": "^1.44.0"
   }
 }
