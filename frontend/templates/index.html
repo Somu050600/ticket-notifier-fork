@@ -686,10 +686,29 @@
     </div>
   </main>
 
-  <!-- Alert Banner (for SW messages) -->
+  <!-- Alert Banner (for SW messages + OTP gate) -->
   <div class="alert-banner" id="alert-banner">
-    <div class="alert-title">🟢 TICKETS AVAILABLE!</div>
+    <div class="alert-title" id="alert-title">🟢 TICKETS AVAILABLE!</div>
     <div class="alert-body" id="alert-body">Tickets found for an event you're watching!</div>
+
+    <!-- OTP gate — shown when auto-checkout is waiting for OTP -->
+    <div id="otp-section" style="display:none; margin-bottom:12px;">
+      <div style="font-size:12px; color:#aaffcc; margin-bottom:6px;">
+        ✅ Booking form auto-filled — enter the OTP sent to your phone:
+      </div>
+      <div style="display:flex; gap:8px;">
+        <input id="otp-input" type="text" inputmode="numeric" maxlength="8"
+               placeholder="Enter OTP"
+               style="flex:1; padding:8px 12px; border-radius:8px; border:1px solid #00e67660;
+                      background:#001a0e; color:#fff; font-size:16px; letter-spacing:4px;
+                      font-family:monospace; text-align:center;">
+        <button class="alert-btn primary" onclick="submitOtp()" style="white-space:nowrap;">
+          Submit OTP
+        </button>
+      </div>
+      <div id="otp-status" style="font-size:11px; color:#aaffcc; margin-top:6px;"></div>
+    </div>
+
     <div class="alert-actions">
       <button class="alert-btn primary" id="alert-open-btn">Open Page</button>
       <button class="alert-btn secondary" onclick="closeAlert()">Dismiss</button>
@@ -1078,20 +1097,88 @@
   }
 
   // ── Alert banner ────────────────────────────────────────────────────────────
-  function showAlertBanner(url, msg) {
-    document.getElementById('alert-body').textContent   = msg;
-    document.getElementById('alert-open-btn').onclick   = () => window.open(url, '_blank');
+  let _otpWatcherId = null;
+  let _otpPollTimer = null;
+
+  function showAlertBanner(url, msg, watcherId = null) {
+    document.getElementById('alert-body').textContent = msg;
+    document.getElementById('alert-open-btn').onclick = () => window.open(url, '_blank');
     document.getElementById('alert-banner').classList.add('show');
+    document.getElementById('otp-section').style.display = 'none';
+    document.getElementById('otp-status').textContent = '';
+    document.getElementById('otp-input').value = '';
 
-    // Play alarm sound via AudioContext
     playAlarmSound();
-
     setTimeout(() => closeAlert(), 30000);
+
+    // Begin polling checkout status if we have a watcher id
+    if (watcherId) {
+      _otpWatcherId = watcherId;
+      _startCheckoutStatusPoll(watcherId);
+    }
   }
 
   function closeAlert() {
     document.getElementById('alert-banner').classList.remove('show');
     stopAlarmSound();
+    if (_otpPollTimer) { clearInterval(_otpPollTimer); _otpPollTimer = null; }
+  }
+
+  // Poll /api/checkout-status/<id> — shows OTP input when automation is waiting
+  function _startCheckoutStatusPoll(watcherId) {
+    if (_otpPollTimer) clearInterval(_otpPollTimer);
+    _otpPollTimer = setInterval(async () => {
+      try {
+        const res  = await fetch(`/api/checkout-status/${watcherId}`);
+        const data = await res.json();
+
+        if (data.status === 'otp_required') {
+          document.getElementById('otp-section').style.display = 'block';
+          document.getElementById('alert-body').textContent =
+            '🤖 Auto-checkout filled your details — enter OTP to confirm:';
+          document.getElementById('alert-title').textContent = '🔐 OTP REQUIRED';
+          clearInterval(_otpPollTimer); // stop polling once OTP screen is shown
+        } else if (data.status === 'success') {
+          document.getElementById('otp-section').style.display = 'none';
+          document.getElementById('alert-title').textContent = '✅ BOOKED!';
+          document.getElementById('alert-body').textContent  = '🎉 Booking confirmed! Check your email.';
+          clearInterval(_otpPollTimer);
+          showToast('🎉 Booking confirmed!', 'success');
+        } else if (data.status === 'failed') {
+          document.getElementById('otp-section').style.display = 'none';
+          document.getElementById('alert-body').textContent  =
+            `⚠️ Auto-checkout failed: ${data.message}. Open the page manually.`;
+          clearInterval(_otpPollTimer);
+        }
+      } catch(e) { /* silent */ }
+    }, 2000);
+  }
+
+  // Submit OTP typed by the user to the backend
+  async function submitOtp() {
+    const otp = document.getElementById('otp-input').value.trim();
+    const statusEl = document.getElementById('otp-status');
+    if (!otp || !_otpWatcherId) return;
+
+    statusEl.textContent = 'Submitting OTP…';
+    try {
+      const res = await fetch('/api/submit-otp', {
+        method:  'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body:    JSON.stringify({ watcher_id: _otpWatcherId, otp }),
+      });
+      const data = await res.json();
+      if (data.ok) {
+        statusEl.textContent = '✅ OTP sent — completing booking…';
+        document.getElementById('otp-input').disabled = true;
+        // Resume polling to catch success/failed result
+        _startCheckoutStatusPoll(_otpWatcherId);
+      } else {
+        statusEl.textContent = '❌ Failed to send OTP — try again.';
+      }
+    } catch(e) {
+      statusEl.textContent = '❌ Network error — try again.';
+    }
   }
 
   // ── LOUD repeating alarm ──────────────────────────────────────────────────
@@ -1155,8 +1242,8 @@
         if (prev !== 'available' && !_alarmActive) {
           _alarmActive = true;
           const url = w.checkout_url || w.url;
-          showAlertBanner(url, `${w.name} — TICKETS AVAILABLE! Go go go!`);
-          showToast('🎫 TICKETS AVAILABLE!', 'success');
+          showAlertBanner(url, `${w.name} — Auto-checkout started! Standby…`, w.id);
+          showToast('🎫 TICKETS AVAILABLE! Auto-booking…', 'success');
           // Auto-stop alarm flag after 2 minutes so it can re-trigger
           setTimeout(() => { _alarmActive = false; }, 120000);
         }

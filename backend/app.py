@@ -25,8 +25,10 @@ load_dotenv(ROOT_DIR / ".env")
 
 try:
     from .scraper import check_url_availability
+    from .autocheckout import trigger_auto_checkout, get_session, inject_otp
 except ImportError:
     from scraper import check_url_availability
+    from autocheckout import trigger_auto_checkout, get_session, inject_otp
 
 logging.basicConfig(
     level=logging.INFO,
@@ -234,6 +236,15 @@ def notify_all(watcher, status):
         )
     else:
         return
+
+    # ── Auto-checkout (triggered only when status is available) ──────────────
+    if status == "available":
+        checkout_url = watcher.get("checkout_url") or watcher["url"]
+        threading.Thread(
+            target=trigger_auto_checkout,
+            args=(watcher["id"], checkout_url),
+            daemon=True,
+        ).start()
 
     # ── Direct alerts (SMS + Email) ───────────────────────────────────────────
     threading.Thread(target=send_sms_alert,   args=(sms_msg,),            daemon=True).start()
@@ -502,6 +513,24 @@ def service_worker():
 @app.route("/manifest.json")
 def manifest():
     return send_from_directory(app.static_folder, "manifest.json")
+
+@app.route("/api/checkout-status/<watcher_id>")
+def checkout_status(watcher_id):
+    """Frontend polls this to know when OTP is required or booking is done."""
+    return jsonify(get_session(watcher_id))
+
+
+@app.route("/api/submit-otp", methods=["POST"])
+def submit_otp():
+    """Receives OTP from the user and delivers it to the waiting automation."""
+    body = request.json or {}
+    watcher_id = body.get("watcher_id", "").strip()
+    otp        = body.get("otp", "").strip()
+    if not watcher_id or not otp:
+        return jsonify({"error": "watcher_id and otp are required"}), 400
+    inject_otp(watcher_id, otp)
+    return jsonify({"ok": True})
+
 
 if __name__ == "__main__":
     start_monitor()
