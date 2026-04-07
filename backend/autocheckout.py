@@ -552,12 +552,42 @@ def trigger_auto_checkout(watcher_id: str, checkout_url: str,
                           target_price: str = "",
                           owner_email: str = ""):
     """
-    Starts one session per configured card (highest priority first).
-    cart_mode=True  → adds to cart and sends cart URL to user (default).
-    cart_mode=False → full checkout including card fill and OTP.
+    cart_mode=True  → select seats, add to cart, send cart URL (NO card needed).
+    cart_mode=False → full checkout including card fill and OTP (needs cards).
     target_price    → e.g. "1500" selects that seat tier automatically.
     """
     pool = _load_card_pool()
+
+    if cart_mode:
+        # Cart mode: only one session needed — no card details required
+        dummy_card = pool[0] if pool else {"priority": 1, "number": "", "expiry": "", "cvv": "", "name": ""}
+        sid = _session_id(watcher_id, 1)
+
+        with _sessions_lock:
+            existing = _sessions.get(sid, {}).get("status")
+            if existing in ("running", "otp_required", "cart_ready"):
+                logger.info(f"[{sid}] Already running — skipping")
+                return
+            _sessions[sid] = {
+                "status":        "running",
+                "message":       "Starting cart-add…",
+                "otp":           None,
+                "device_id":     None,
+                "card_priority": 1,
+                "cart_url":      None,
+                "cart_mode":     True,
+            }
+
+        logger.info(f"[{sid}] Launching CART MODE"
+                    + (f" targeting ₹{target_price}" if target_price else ""))
+        threading.Thread(
+            target=_run_in_thread,
+            args=(sid, checkout_url, dummy_card, True, target_price, watcher_id),
+            daemon=True,
+        ).start()
+        return
+
+    # Full checkout mode: one session per card
     if not pool:
         logger.warning("No cards configured — set CARD_1_NUMBER etc. in env vars")
         return
@@ -577,14 +607,13 @@ def trigger_auto_checkout(watcher_id: str, checkout_url: str,
                 "device_id":     None,
                 "card_priority": card["priority"],
                 "cart_url":      None,
-                "cart_mode":     cart_mode,
+                "cart_mode":     False,
             }
 
-        logger.info(f"[{sid}] Launching {'cart' if cart_mode else 'checkout'} "
-                    f"with card #{card['priority']}"
+        logger.info(f"[{sid}] Launching FULL CHECKOUT with card #{card['priority']}"
                     + (f" targeting ₹{target_price}" if target_price else ""))
         threading.Thread(
             target=_run_in_thread,
-            args=(sid, checkout_url, card, cart_mode, target_price, watcher_id),
+            args=(sid, checkout_url, card, False, target_price, watcher_id),
             daemon=True,
         ).start()

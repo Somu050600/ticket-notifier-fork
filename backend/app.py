@@ -240,10 +240,25 @@ def send_push(subscription_info, payload):
         return False
 
 
+def _derive_checkout_url(event_url: str) -> str:
+    """
+    Auto-generate a BookMyShow buytickets URL from an event URL.
+    /sports/event-name/ET001234  →  /buytickets/event-name/ET001234
+    Falls back to the original URL if not a recognizable pattern.
+    """
+    import re
+    # BookMyShow: .../sports/slug/ETXXXXXX or .../events/slug/ETXXXXXX
+    m = re.search(r'in\.bookmyshow\.com/(?:sports|events)/([^?#]+)', event_url)
+    if m:
+        slug = m.group(1).rstrip('/')
+        return f"https://in.bookmyshow.com/buytickets/{slug}"
+    return event_url
+
+
 def notify_all(watcher, status):
     data = load_data()
     subs = data.get("subscriptions", [])
-    target_url = watcher.get("checkout_url") or watcher["url"]
+    target_url = watcher.get("checkout_url") or _derive_checkout_url(watcher["url"])
 
     if status == "available":
         payload = {
@@ -286,7 +301,7 @@ def notify_all(watcher, status):
 
     # ── Auto-checkout / cart-add (triggered only when status is available) ──────
     if status == "available":
-        checkout_url = watcher.get("checkout_url") or watcher["url"]
+        checkout_url = watcher.get("checkout_url") or _derive_checkout_url(watcher["url"])
         threading.Thread(
             target=trigger_auto_checkout,
             args=(watcher["id"], checkout_url),
@@ -323,7 +338,7 @@ _stop_event = threading.Event()
 _data_lock = threading.Lock()
 
 USE_BROWSER = os.environ.get("USE_BROWSER", "true").lower() == "true"
-MIN_CHECK_INTERVAL_SECONDS = max(5, int(os.environ.get("MIN_CHECK_INTERVAL_SECONDS", "5")))
+MIN_CHECK_INTERVAL_SECONDS = max(3, int(os.environ.get("MIN_CHECK_INTERVAL_SECONDS", "5")))
 MONITOR_LOOP_SECONDS = max(2, int(os.environ.get("MONITOR_LOOP_SECONDS", "2")))
 
 
@@ -342,16 +357,17 @@ def apply_check_result(watcher, result):
     if result.get("price"):
         watcher["price"] = result["price"]
 
-    # Alert on every transition into available/upcoming,
-    # OR if available and no alert has been sent yet (e.g. after restart)
+    # Alert once when transitioning into "available" or "upcoming".
+    # Set alerted_at BEFORE calling notify_all to prevent double-fire
+    # on rapid consecutive checks.
     alert_needed = (
         (status != prev_status and status in ("available", "upcoming"))
         or (status == "available" and not watcher.get("alerted_at"))
     )
     if alert_needed:
+        if status == "available":
+            watcher["alerted_at"] = datetime.now().isoformat()
         notify_all(watcher, status)
-    if status == "available" and not watcher.get("alerted_at"):
-        watcher["alerted_at"] = datetime.now().isoformat()
 
     return watcher
 
