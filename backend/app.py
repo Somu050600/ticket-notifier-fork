@@ -255,8 +255,8 @@ _stop_event = threading.Event()
 _data_lock = threading.Lock()
 
 USE_BROWSER = os.environ.get("USE_BROWSER", "true").lower() == "true"
-MIN_CHECK_INTERVAL_SECONDS = max(15, int(os.environ.get("MIN_CHECK_INTERVAL_SECONDS", "15")))
-MONITOR_LOOP_SECONDS = max(5, int(os.environ.get("MONITOR_LOOP_SECONDS", "5")))
+MIN_CHECK_INTERVAL_SECONDS = max(5, int(os.environ.get("MIN_CHECK_INTERVAL_SECONDS", "5")))
+MONITOR_LOOP_SECONDS = max(2, int(os.environ.get("MONITOR_LOOP_SECONDS", "2")))
 
 
 def apply_check_result(watcher, result):
@@ -274,9 +274,15 @@ def apply_check_result(watcher, result):
     if result.get("price"):
         watcher["price"] = result["price"]
 
-    if status != prev_status and status in ("available", "upcoming"):
+    # Alert on every transition into available/upcoming,
+    # OR if available and no alert has been sent yet (e.g. after restart)
+    alert_needed = (
+        (status != prev_status and status in ("available", "upcoming"))
+        or (status == "available" and not watcher.get("alerted_at"))
+    )
+    if alert_needed:
         notify_all(watcher, status)
-    if status == "available" and prev_status != "available":
+    if status == "available" and not watcher.get("alerted_at"):
         watcher["alerted_at"] = datetime.now().isoformat()
 
     return watcher
@@ -373,7 +379,7 @@ def add_watcher():
         interval = int(body.get("interval_seconds", MIN_CHECK_INTERVAL_SECONDS))
     except (TypeError, ValueError):
         return jsonify({"error": "Check interval must be a number"}), 400
-    interval = max(MIN_CHECK_INTERVAL_SECONDS, interval)
+    interval = max(5, interval)
 
     if not url:
         return jsonify({"error": "URL is required"}), 400
