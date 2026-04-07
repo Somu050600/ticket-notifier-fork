@@ -856,18 +856,28 @@
   let watchers = [];
 
   async function loadWatchers() {
-    const res = await fetch('/api/watchers');
-    watchers = await res.json();
-    renderWatchers();
+    try {
+      const res = await fetch('/api/watchers');
+      if (!res.ok) throw new Error(`HTTP ${res.status}`);
+      watchers = await res.json();
+      renderWatchers();
+    } catch(e) {
+      console.warn('[TicketAlert] loadWatchers failed:', e.message);
+    }
   }
 
   async function loadStats() {
-    const res = await fetch('/api/stats');
-    const s = await res.json();
-    document.getElementById('stat-total').textContent     = s.total;
-    document.getElementById('stat-available').textContent = s.available;
-    document.getElementById('stat-sold').textContent      = s.sold_out;
-    document.getElementById('stat-subs').textContent      = s.subscribers;
+    try {
+      const res = await fetch('/api/stats');
+      if (!res.ok) throw new Error(`HTTP ${res.status}`);
+      const s = await res.json();
+      document.getElementById('stat-total').textContent     = s.total;
+      document.getElementById('stat-available').textContent = s.available;
+      document.getElementById('stat-sold').textContent      = s.sold_out;
+      document.getElementById('stat-subs').textContent      = s.subscribers;
+    } catch(e) {
+      console.warn('[TicketAlert] loadStats failed:', e.message);
+    }
   }
 
   function renderWatchers() {
@@ -1160,6 +1170,13 @@
   initSW();
   poll();
   setInterval(poll, 5000); // refresh UI every 5s
+
+  // When the tab comes back into focus after being hidden, poll immediately
+  // instead of waiting for the next 5s tick (Chrome throttles timers on
+  // background tabs, so the interval may have drifted by up to 60 seconds).
+  document.addEventListener('visibilitychange', () => {
+    if (document.visibilityState === 'visible') poll();
+  });
   </script>
 </body>
 </html>

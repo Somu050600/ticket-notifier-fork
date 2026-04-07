@@ -60,9 +60,25 @@ self.addEventListener("notificationclick", (event) => {
 
   const url = event.notification.data?.url || "/";
 
+  // Determine whether the target is external (e.g. BookMyShow checkout URL)
+  // or internal (the TicketAlert app itself).
+  const isExternal = url.startsWith("http") && !url.includes(self.location.hostname);
+
   event.waitUntil(
     clients.matchAll({ type: "window", includeUncontrolled: true }).then((clientList) => {
-      // Focus existing tab if open
+      // For external URLs (checkout pages) always open a new tab so the user
+      // lands directly on the booking page — never reuse the TicketAlert tab.
+      if (isExternal) {
+        // Also notify any open TicketAlert tab so the banner shows there too
+        for (const client of clientList) {
+          if (client.url.includes(self.location.hostname)) {
+            client.postMessage({ type: "TICKET_AVAILABLE", url });
+          }
+        }
+        return clients.openWindow(url);
+      }
+
+      // For internal URLs: focus existing TicketAlert tab if open
       for (const client of clientList) {
         if (client.url.includes(self.location.origin) && "focus" in client) {
           client.focus();
