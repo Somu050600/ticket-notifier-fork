@@ -1,0 +1,13 @@
+{
+  "name": "ticketalert-api-client",
+  "version": "1.0.0",
+  "description": "Resilient API client for TicketAlert event-monitoring microservice",
+  "main": "src/ticketAlert.js",
+  "type": "module",
+  "scripts": {
+    "start": "node src/ticketAlert.js"
+  },
+  "dependencies": {
+    "axios": "^1.7.2"
+  }
+}
