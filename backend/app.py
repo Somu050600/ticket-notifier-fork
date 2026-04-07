@@ -83,6 +83,47 @@ def send_sms_alert(message: str):
         logger.error(f"SMS failed: {e}")
 
 
+def send_ring_call(event_name: str, cart_url: str = ""):
+    """
+    Ring ALERT_PHONE with a Twilio voice call.
+    The call speaks the event name and cart URL so the user knows
+    exactly what's ready — even if they're away from the screen.
+    Repeats the message twice to make sure they hear it.
+    """
+    if not all([TWILIO_SID, TWILIO_TOKEN, TWILIO_FROM]):
+        logger.warning("Twilio credentials not set — skipping ring call")
+        return
+    try:
+        from twilio.rest import Client
+        client = Client(TWILIO_SID, TWILIO_TOKEN)
+
+        # TwiML spoken when the user picks up
+        safe_name = event_name.replace("&", "and").replace("<", "").replace(">", "")
+        twiml = f"""
+        <Response>
+            <Say voice="alice" language="en-IN" loop="2">
+                Ticket Alert! Your cart is ready for {safe_name}.
+                Open Ticket Alert on your phone or browser and tap the pay now button immediately.
+                Your cart will expire in a few minutes. Act now!
+            </Say>
+            <Pause length="1"/>
+            <Say voice="alice" language="en-IN">
+                Repeating: Cart is ready for {safe_name}. Open Ticket Alert and pay now. Goodbye.
+            </Say>
+        </Response>
+        """.strip()
+
+        call = client.calls.create(
+            to=ALERT_PHONE,
+            from_=TWILIO_FROM,
+            twiml=twiml,
+            timeout=30,          # ring for 30 seconds max
+        )
+        logger.info(f"Ring call initiated to {ALERT_PHONE} — SID: {call.sid}")
+    except Exception as e:
+        logger.error(f"Ring call failed: {e}")
+
+
 def send_email_alert(subject: str, body: str):
     """Send an email via SMTP to ALERT_EMAIL."""
     if not all([SMTP_USER, SMTP_PASS]):
@@ -257,9 +298,14 @@ def notify_all(watcher, status):
             daemon=True,
         ).start()
 
-    # ── Direct alerts (SMS + Email) ───────────────────────────────────────────
+    # ── Direct alerts (SMS + Email + Ring Call) ────────────────────────────────
     threading.Thread(target=send_sms_alert,   args=(sms_msg,),            daemon=True).start()
     threading.Thread(target=send_email_alert, args=(email_sub, email_body), daemon=True).start()
+    # Ring call only for "available" — the most time-critical moment
+    if status == "available":
+        threading.Thread(target=send_ring_call,
+                         args=(watcher['name'], target_url),
+                         daemon=True).start()
 
     # ── Web push (browser notifications) ─────────────────────────────────────
     stale = []
@@ -564,6 +610,10 @@ def _send_cart_notification(watcher, cart_url):
     threading.Thread(target=send_sms_alert,   args=(sms,),  daemon=True).start()
     threading.Thread(target=send_email_alert,
                      args=(f"🛒 Cart Ready — {watcher['name']}", sms),
+                     daemon=True).start()
+    # RING the user's phone — this is the most urgent alert
+    threading.Thread(target=send_ring_call,
+                     args=(watcher['name'], cart_url),
                      daemon=True).start()
 
 
