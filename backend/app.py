@@ -15,7 +15,7 @@ from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
 from pathlib import Path
 
-from flask import Flask, request, jsonify, render_template, send_from_directory
+from flask import Flask, request, jsonify, render_template, send_from_directory, session
 from flask_cors import CORS
 from dotenv import load_dotenv
 from pywebpush import webpush, WebPushException
@@ -27,10 +27,12 @@ try:
     from .scraper import check_url_availability
     from .autocheckout import (trigger_auto_checkout, claim_slot,
                                 get_session, get_session_for_device, inject_otp)
+    from .auth import auth_bp, current_user, require_login, user_id
 except ImportError:
     from scraper import check_url_availability
     from autocheckout import (trigger_auto_checkout, claim_slot,
                                get_session, get_session_for_device, inject_otp)
+    from auth import auth_bp, current_user, require_login, user_id
 
 logging.basicConfig(
     level=logging.INFO,
@@ -43,7 +45,9 @@ app = Flask(
     template_folder=str(ROOT_DIR / "frontend" / "templates"),
     static_folder=str(ROOT_DIR / "frontend" / "static"),
 )
-CORS(app)
+app.secret_key = os.environ.get("SECRET_KEY", os.urandom(32))
+CORS(app, supports_credentials=True)
+app.register_blueprint(auth_bp)
 
 VAPID_PRIVATE_KEY = os.environ.get("VAPID_PRIVATE_KEY", "")
 VAPID_PUBLIC_KEY  = os.environ.get("VAPID_PUBLIC_KEY", "")
@@ -239,12 +243,17 @@ def notify_all(watcher, status):
     else:
         return
 
-    # ── Auto-checkout (triggered only when status is available) ──────────────
+    # ── Auto-checkout / cart-add (triggered only when status is available) ──────
     if status == "available":
         checkout_url = watcher.get("checkout_url") or watcher["url"]
         threading.Thread(
             target=trigger_auto_checkout,
             args=(watcher["id"], checkout_url),
+            kwargs={
+                "cart_mode":    watcher.get("cart_mode", True),
+                "target_price": watcher.get("target_price", ""),
+                "owner_email":  watcher.get("owner", ""),
+            },
             daemon=True,
         ).start()
 
@@ -356,6 +365,7 @@ def vapid_key():
 @app.route("/api/subscribe", methods=["POST"])
 def subscribe():
     sub_info = request.json
+    sub_info["owner"] = user_id()   # tag subscription with logged-in Gmail
     with _data_lock:
         data = load_data()
         if not any(s.get("endpoint") == sub_info.get("endpoint") for s in data["subscriptions"]):
@@ -374,7 +384,12 @@ def unsubscribe():
 
 @app.route("/api/watchers", methods=["GET"])
 def get_watchers():
-    return jsonify(load_data()["watchers"])
+    uid = user_id()
+    all_w = load_data()["watchers"]
+    # If logged in, show only this user's watchers; else show legacy (no owner) watchers
+    if uid:
+        return jsonify([w for w in all_w if w.get("owner") == uid])
+    return jsonify([w for w in all_w if not w.get("owner")])
 
 ALLOWED_DOMAINS = [
     "bookmyshow.com", "in.bookmyshow.com", "district.in",
@@ -412,6 +427,9 @@ def add_watcher():
                 platform = d.split(".")[0]
                 break
 
+        target_price = body.get("target_price", "").strip()   # e.g. "1500" or "₹1500"
+        cart_mode    = bool(body.get("cart_mode", True))       # default: add-to-cart only
+
         watcher = {
             "id": str(uuid.uuid4())[:8],
             "url": url,
@@ -423,9 +441,13 @@ def add_watcher():
             "last_checked": None,
             "last_checked_ts": 0,
             "price": "",
+            "target_price": target_price,
+            "cart_mode": cart_mode,
+            "cart_url": None,
             "paused": False,
             "done": False,
             "added_at": datetime.now().isoformat(),
+            "owner": user_id(),          # tied to logged-in Gmail account
         }
         data["watchers"].append(watcher)
         save_data(data)
@@ -503,6 +525,47 @@ def stats():
         "sold_out": sum(1 for x in w if x.get("last_status") == "sold_out"),
         "subscribers": len(data["subscriptions"]),
     })
+
+@app.route("/api/watchers/<watcher_id>/cart-url", methods=["POST"])
+def update_cart_url(watcher_id):
+    """Internal — called by autocheckout to store the captured cart URL."""
+    cart_url = (request.json or {}).get("cart_url", "")
+    with _data_lock:
+        data = load_data()
+        for w in data["watchers"]:
+            if w["id"] == watcher_id:
+                w["cart_url"] = cart_url
+                save_data(data)
+                # Push cart-ready notification to the watcher's owner
+                _send_cart_notification(w, cart_url)
+                return jsonify({"ok": True})
+    return jsonify({"error": "Not found"}), 404
+
+
+def _send_cart_notification(watcher, cart_url):
+    """Push + SMS + email to the watcher owner when their cart is ready."""
+    data = load_data()
+    payload = {
+        "type":              "CART_READY",
+        "title":             "🛒 Cart Ready — Complete Payment!",
+        "body":              f"{watcher['name']} — Your cart is reserved. Tap to pay now.",
+        "url":               cart_url,
+        "alarm":             True,
+        "requireInteraction": True,
+        "vibrate":           [300, 100, 300, 100, 600],
+        "tag":               f"cart-{watcher['id']}",
+    }
+    owner = watcher.get("owner", "")
+    for sub in data.get("subscriptions", []):
+        if not owner or sub.get("owner") == owner:
+            send_push(sub, payload)
+
+    sms = f"🛒 Cart ready for {watcher['name']}! Pay here: {cart_url}"
+    threading.Thread(target=send_sms_alert,   args=(sms,),  daemon=True).start()
+    threading.Thread(target=send_email_alert,
+                     args=(f"🛒 Cart Ready — {watcher['name']}", sms),
+                     daemon=True).start()
+
 
 @app.route("/health")
 def health():

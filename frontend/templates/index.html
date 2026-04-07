@@ -540,6 +540,24 @@
       <div class="logo-text">Ticket<span>Alert</span></div>
     </div>
     <div class="header-right">
+      <!-- Google login / user pill -->
+      <div id="auth-area">
+        <a href="/auth/login" id="login-btn" style="display:none;
+          padding:8px 18px; background:white; border:1.5px solid var(--border);
+          border-radius:10px; font-size:13px; font-weight:600; color:var(--text);
+          text-decoration:none; display:flex; align-items:center; gap:8px;">
+          <img src="https://www.gstatic.com/firebasejs/ui/2.0.0/images/auth/google.svg"
+               style="width:16px;height:16px;"> Sign in with Google
+        </a>
+        <div id="user-pill" style="display:none;
+          padding:6px 14px; background:rgba(124,58,237,.1);
+          border:1.5px solid var(--border); border-radius:20px;
+          font-size:13px; font-weight:600; display:flex; align-items:center; gap:8px;">
+          <img id="user-avatar" src="" style="width:24px;height:24px;border-radius:50%;">
+          <span id="user-name"></span>
+          <a href="/auth/logout" style="color:var(--muted);font-size:11px;margin-left:4px;">↩</a>
+        </div>
+      </div>
       <button id="bell-btn" onclick="toggleNotifications()">
         <span class="bell">🔕</span>
         <span id="bell-label">Enable Alerts</span>
@@ -606,6 +624,16 @@
         <div class="field">
           <label>Fast Checkout URL (optional)</label>
           <input type="url" id="input-checkout-url" placeholder="https://in.bookmyshow.com/buytickets/...">
+        </div>
+        <div class="field">
+          <label>Target Seat Price ₹ (optional)</label>
+          <input type="number" id="input-target-price" placeholder="e.g. 1500 — bot picks this tier">
+        </div>
+        <div class="field" style="justify-content:flex-end;align-self:flex-end;">
+          <label style="display:flex;align-items:center;gap:8px;cursor:pointer;">
+            <input type="checkbox" id="input-cart-mode" checked style="width:16px;height:16px;accent-color:var(--accent);">
+            <span>Cart mode <small style="color:var(--muted)">(add to cart, you pay)</small></span>
+          </label>
         </div>
       </div>
       <div style="margin-top:14px;">
@@ -686,15 +714,31 @@
     </div>
   </main>
 
-  <!-- Alert Banner (for SW messages + OTP gate) -->
+  <!-- Alert Banner (tickets available / cart ready / OTP gate) -->
   <div class="alert-banner" id="alert-banner">
     <div class="alert-title" id="alert-title">🟢 TICKETS AVAILABLE!</div>
     <div class="alert-body" id="alert-body">Tickets found for an event you're watching!</div>
 
-    <!-- OTP gate — shown when auto-checkout is waiting for OTP -->
+    <!-- Cart-ready section — shown when bot has added to cart -->
+    <div id="cart-section" style="display:none; margin-bottom:12px;">
+      <div style="font-size:12px; color:#aaffcc; margin-bottom:8px;">
+        🛒 Seats selected &amp; added to cart — tap below to pay now:
+      </div>
+      <a id="cart-pay-btn" href="#" target="_blank" rel="noopener"
+         style="display:block; text-align:center; padding:12px; border-radius:10px;
+                background:linear-gradient(135deg,#7c3aed,#a855f7); color:#fff;
+                font-weight:700; font-size:15px; text-decoration:none; letter-spacing:.3px;">
+        💳 Complete Payment →
+      </a>
+      <div style="font-size:11px; color:#88cc99; margin-top:6px; text-align:center;">
+        Link expires soon — pay immediately
+      </div>
+    </div>
+
+    <!-- OTP gate — shown when full-checkout mode is waiting for OTP -->
     <div id="otp-section" style="display:none; margin-bottom:12px;">
       <div style="font-size:12px; color:#aaffcc; margin-bottom:6px;">
-        ✅ Booking form auto-filled — enter the OTP sent to your phone:
+        ✅ Form auto-filled — enter the OTP sent to your phone:
       </div>
       <div style="display:flex; gap:8px;">
         <input id="otp-input" type="text" inputmode="numeric" maxlength="8"
@@ -720,6 +764,30 @@
   <script>
   const VAPID_PUBLIC_KEY = "{{ vapid_public_key }}";
   const PROFILE_STORAGE_KEY = 'ticketalert.checkoutProfile';
+
+  // ── Google auth UI ───────────────────────────────────────────────────────────
+  (async function initAuth() {
+    try {
+      const res  = await fetch('/auth/me');
+      const user = await res.json();
+      if (user && user.email) {
+        document.getElementById('login-btn').style.display  = 'none';
+        document.getElementById('user-pill').style.display  = 'flex';
+        document.getElementById('user-name').textContent    = user.name || user.email;
+        document.getElementById('user-avatar').src          = user.picture || '';
+      } else {
+        document.getElementById('login-btn').style.display  = 'flex';
+        document.getElementById('user-pill').style.display  = 'none';
+      }
+    } catch(e) {
+      document.getElementById('login-btn').style.display = 'flex';
+    }
+    // Show success/error toast from OAuth redirect
+    const p = new URLSearchParams(location.search);
+    if (p.get('auth') === 'success') showToast('✅ Signed in with Google!', 'success');
+    if (p.get('auth') === 'error')   showToast('❌ Google sign-in failed', 'error');
+    if (p.has('auth')) history.replaceState({}, '', '/');
+  })();
 
   // ── Utilities ───────────────────────────────────────────────────────────────
   function urlB64ToUint8Array(base64String) {
@@ -1020,11 +1088,13 @@
   }
 
   async function addWatcher() {
-    const url      = document.getElementById('input-url').value.trim();
+    const url         = document.getElementById('input-url').value.trim();
     const checkoutUrl = document.getElementById('input-checkout-url').value.trim();
-    const name     = document.getElementById('input-name').value.trim();
-    const interval = parseInt(document.getElementById('input-interval').value);
-    const btn      = document.querySelector('.btn-add');
+    const name        = document.getElementById('input-name').value.trim();
+    const interval    = parseInt(document.getElementById('input-interval').value);
+    const targetPrice = document.getElementById('input-target-price').value.trim();
+    const cartMode    = document.getElementById('input-cart-mode').checked;
+    const btn         = document.querySelector('.btn-add');
 
     if (!url) { showError('Please enter an event URL'); return; }
 
@@ -1038,7 +1108,10 @@
       const res = await fetch('/api/watchers', {
         method: 'POST',
         headers: {'Content-Type':'application/json'},
-        body: JSON.stringify({ url, checkout_url: checkoutUrl, name, interval_seconds: interval })
+        body: JSON.stringify({ url, checkout_url: checkoutUrl, name,
+                               interval_seconds: interval,
+                               target_price: targetPrice,
+                               cart_mode: cartMode })
       });
       const data = await res.json();
       if (!res.ok) { showError(data.error || 'Failed to add'); return; }
@@ -1166,21 +1239,36 @@
         const data = await res.json();
         const card = data.card_priority ? `Card #${data.card_priority}` : 'Card';
 
-        if (data.status === 'otp_required') {
-          document.getElementById('otp-section').style.display = 'block';
+        if (data.status === 'cart_ready') {
+          // Bot added to cart — show the pay button with the cart URL
+          const cartUrl = data.cart_url || '#';
+          document.getElementById('cart-section').style.display = 'block';
+          document.getElementById('otp-section').style.display  = 'none';
+          document.getElementById('alert-title').textContent = '🛒 CART READY — PAY NOW!';
+          document.getElementById('alert-body').textContent  =
+            `${card} seats selected &amp; added to cart:`;
+          document.getElementById('cart-pay-btn').href = cartUrl;
+          playAlarmSound();
+          clearInterval(_otpPollTimer);
+          showToast('🛒 Cart ready! Tap to pay.', 'success');
+        } else if (data.status === 'otp_required') {
+          document.getElementById('cart-section').style.display = 'none';
+          document.getElementById('otp-section').style.display  = 'block';
           document.getElementById('alert-title').textContent = '🔐 OTP REQUIRED';
           document.getElementById('alert-body').textContent  =
             `✅ ${card} form filled — enter the OTP sent to your phone:`;
           clearInterval(_otpPollTimer);
         } else if (data.status === 'success') {
-          document.getElementById('otp-section').style.display = 'none';
+          document.getElementById('cart-section').style.display = 'none';
+          document.getElementById('otp-section').style.display  = 'none';
           document.getElementById('alert-title').textContent = '✅ BOOKED!';
           document.getElementById('alert-body').textContent  =
             `🎉 ${card} booking confirmed! Check your email.`;
           clearInterval(_otpPollTimer);
           showToast('🎉 Booking confirmed!', 'success');
         } else if (data.status === 'failed') {
-          document.getElementById('otp-section').style.display = 'none';
+          document.getElementById('cart-section').style.display = 'none';
+          document.getElementById('otp-section').style.display  = 'none';
           document.getElementById('alert-body').textContent  =
             `⚠️ ${card} failed: ${data.message}`;
           clearInterval(_otpPollTimer);

@@ -228,7 +228,110 @@ def _update(session_id: str, **kwargs):
             _sessions[session_id].update(kwargs)
 
 
-async def _run_checkout(session_id: str, checkout_url: str, card: dict):
+async def _select_seat_by_price(page, target_price: str) -> bool:
+    """
+    Finds and clicks the seat category whose price text best matches target_price.
+    Returns True if a matching category was clicked, False otherwise.
+
+    Matching strategy:
+      1. Exact numeric match  (e.g. "1500" in "₹1,500")
+      2. Nearest price above  (next tier up, as a fallback)
+    """
+    if not target_price:
+        return False
+
+    # Normalise target to a plain integer (strip ₹, commas, spaces)
+    target_num = int("".join(filter(str.isdigit, target_price)) or "0")
+    if not target_num:
+        return False
+
+    # Collect all visible seat-category elements with a price
+    category_selectors = [
+        "[class*='price-card']:not([class*='sold-out'])",
+        "[class*='category']:not([class*='disabled']):not([class*='sold'])",
+        "[class*='seat-type']:not([class*='unavailable'])",
+        "li[class*='ticket']:not([class*='sold'])",
+    ]
+
+    for container_sel in category_selectors:
+        try:
+            cards = await page.locator(container_sel).all()
+            if not cards:
+                continue
+
+            candidates = []
+            for card_el in cards:
+                text = (await card_el.text_content() or "").replace(",", "")
+                digits = "".join(filter(str.isdigit, text))
+                if digits:
+                    price_val = int(digits)
+                    candidates.append((price_val, card_el))
+
+            if not candidates:
+                continue
+
+            # Try exact match first
+            for price_val, el in candidates:
+                if price_val == target_num:
+                    await el.scroll_into_view_if_needed()
+                    await el.click()
+                    logger.info(f"Seat selected: ₹{price_val} (exact match)")
+                    return True
+
+            # Fall back to nearest price >= target
+            above = [(v, el) for v, el in candidates if v >= target_num]
+            if above:
+                best_val, best_el = min(above, key=lambda x: x[0])
+                await best_el.scroll_into_view_if_needed()
+                await best_el.click()
+                logger.info(f"Seat selected: ₹{best_val} (nearest above ₹{target_num})")
+                return True
+
+        except Exception:
+            continue
+
+    logger.warning(f"No seat category found matching ₹{target_num}")
+    return False
+
+
+async def _capture_cart_url(page) -> str | None:
+    """
+    Attempts to extract the shareable cart/checkout URL from the current page.
+    Tries: current URL, clipboard API, hidden share-link elements.
+    """
+    url = page.url
+    # BookMyShow cart URLs typically contain 'cart' or 'checkout'
+    if any(k in url.lower() for k in ["cart", "checkout", "order", "booking"]):
+        return url
+    # Try looking for a share / copy-link element
+    for sel in ["[class*='cart-url']", "[data-cart-url]", "input[value*='cart']"]:
+        try:
+            el = page.locator(sel).first
+            if await el.is_visible(timeout=2_000):
+                val = await el.get_attribute("value") or await el.text_content()
+                if val and val.startswith("http"):
+                    return val.strip()
+        except Exception:
+            pass
+    return url   # fall back to current URL
+
+
+def _notify_cart_ready(watcher_id: str, cart_url: str):
+    """Posts cart URL back to Flask so it can push-notify the user."""
+    try:
+        import requests as req
+        req.post(
+            f"http://localhost:{os.environ.get('PORT', 5000)}/api/watchers/{watcher_id}/cart-url",
+            json={"cart_url": cart_url},
+            timeout=5,
+        )
+    except Exception as e:
+        logger.warning(f"Could not notify cart URL: {e}")
+
+
+async def _run_checkout(session_id: str, checkout_url: str, card: dict,
+                        cart_mode: bool = True, target_price: str = "",
+                        watcher_id: str = ""):
     try:
         from playwright.async_api import async_playwright
     except ImportError:
@@ -237,7 +340,8 @@ async def _run_checkout(session_id: str, checkout_url: str, card: dict):
         return
 
     profile = _profile()
-    _update(session_id, status="running", message="Starting checkout…")
+    mode_label = "cart" if cart_mode else "checkout"
+    _update(session_id, status="running", message=f"Starting {mode_label}…")
 
     async with async_playwright() as pw:
         browser = await pw.chromium.launch(
@@ -273,16 +377,22 @@ async def _run_checkout(session_id: str, checkout_url: str, card: dict):
             await page.goto(checkout_url, wait_until="domcontentloaded", timeout=30_000)
             await page.wait_for_load_state("networkidle", timeout=10_000)
 
-            # ── 2. Seat / quantity selection ──────────────────────────────────
-            _update(session_id, message="Selecting seats…")
-            for sel in [
-                "[class*='price-card']:not([class*='sold-out']):first-child",
-                "[class*='category']:not([class*='disabled']):first-child",
-                "li[class*='list']:not([class*='sold']):first-child",
-            ]:
-                if await _click(page, sel, timeout=3_000):
-                    await _rand(0.4, 0.8)
-                    break
+            # ── 2. Seat selection by price (if target_price specified) ────────
+            _update(session_id, message=f"Selecting seats{' at ₹'+target_price if target_price else ''}…")
+            seat_picked = False
+            if target_price:
+                seat_picked = await _select_seat_by_price(page, target_price)
+
+            # Fallback: pick cheapest available category if no price target or match
+            if not seat_picked:
+                for sel in [
+                    "[class*='price-card']:not([class*='sold-out']):first-child",
+                    "[class*='category']:not([class*='disabled']):first-child",
+                    "li[class*='list']:not([class*='sold']):first-child",
+                ]:
+                    if await _click(page, sel, timeout=3_000):
+                        await _rand(0.4, 0.8)
+                        break
 
             # Set max quantity
             for sel in ["select[id*='qty']", "select[name*='qty']",
@@ -310,7 +420,21 @@ async def _run_checkout(session_id: str, checkout_url: str, card: dict):
             await _fill(page, "input[type='email'], input[name*='email' i]",          profile["email"])
             await _fill(page, "input[type='tel'],   input[name*='phone' i]",          profile["phone"])
 
-            # ── 4. Card details (THIS session's assigned card) ────────────────
+            # ── 4a. CART MODE — stop here, capture URL, notify user ───────────
+            if cart_mode:
+                _update(session_id, message="Capturing cart URL…")
+                await _rand(1.0, 2.0)
+                cart_url = await _capture_cart_url(page)
+                _update(session_id,
+                        status="cart_ready",
+                        message="Cart is ready — tap the link to pay",
+                        cart_url=cart_url)
+                logger.info(f"[{session_id}] Cart URL: {cart_url}")
+                if watcher_id:
+                    _notify_cart_ready(watcher_id, cart_url)
+                return   # ← hand off to user for payment
+
+            # ── 4b. FULL CHECKOUT — fill card and pay ─────────────────────────
             _update(session_id, message=f"Filling card #{card['priority']}…")
             await _fill(
                 page,
@@ -327,7 +451,6 @@ async def _run_checkout(session_id: str, checkout_url: str, card: dict):
                 "input[name*='cvv' i], input[placeholder*='CVV' i]",
                 card["cvv"],
             )
-            # Payment iframes (Razorpay / Stripe)
             for iframe_sel in ["iframe[src*='razorpay']", "iframe[src*='stripe']",
                                "iframe[name*='card']",    "iframe[title*='payment' i]"]:
                 try:
@@ -340,7 +463,7 @@ async def _run_checkout(session_id: str, checkout_url: str, card: dict):
                 except Exception:
                     pass
 
-            # ── 5. Click Pay ──────────────────────────────────────────────────
+            # Click Pay
             await _click_first(page, [
                 "button:has-text('Pay Now')",
                 "button:has-text('Confirm')",
@@ -409,19 +532,30 @@ async def _run_checkout(session_id: str, checkout_url: str, card: dict):
 
 # ── Thread entry point ────────────────────────────────────────────────────────
 
-def _run_in_thread(session_id: str, checkout_url: str, card: dict):
+def _run_in_thread(session_id: str, checkout_url: str, card: dict,
+                   cart_mode: bool, target_price: str, watcher_id: str):
     loop = asyncio.new_event_loop()
     asyncio.set_event_loop(loop)
     try:
-        loop.run_until_complete(_run_checkout(session_id, checkout_url, card))
+        loop.run_until_complete(
+            _run_checkout(session_id, checkout_url, card,
+                          cart_mode=cart_mode,
+                          target_price=target_price,
+                          watcher_id=watcher_id)
+        )
     finally:
         loop.close()
 
 
-def trigger_auto_checkout(watcher_id: str, checkout_url: str):
+def trigger_auto_checkout(watcher_id: str, checkout_url: str,
+                          cart_mode: bool = True,
+                          target_price: str = "",
+                          owner_email: str = ""):
     """
-    Starts one checkout thread per configured card (highest priority first).
-    Already-running sessions for this watcher are not restarted.
+    Starts one session per configured card (highest priority first).
+    cart_mode=True  → adds to cart and sends cart URL to user (default).
+    cart_mode=False → full checkout including card fill and OTP.
+    target_price    → e.g. "1500" selects that seat tier automatically.
     """
     pool = _load_card_pool()
     if not pool:
@@ -433,21 +567,24 @@ def trigger_auto_checkout(watcher_id: str, checkout_url: str):
 
         with _sessions_lock:
             existing = _sessions.get(sid, {}).get("status")
-            if existing in ("running", "otp_required"):
+            if existing in ("running", "otp_required", "cart_ready"):
                 logger.info(f"[{sid}] Already running — skipping")
                 continue
-            # Initialise the slot
             _sessions[sid] = {
                 "status":        "running",
                 "message":       "Starting…",
                 "otp":           None,
                 "device_id":     None,
                 "card_priority": card["priority"],
+                "cart_url":      None,
+                "cart_mode":     cart_mode,
             }
 
-        logger.info(f"[{sid}] Launching checkout with card #{card['priority']}")
+        logger.info(f"[{sid}] Launching {'cart' if cart_mode else 'checkout'} "
+                    f"with card #{card['priority']}"
+                    + (f" targeting ₹{target_price}" if target_price else ""))
         threading.Thread(
             target=_run_in_thread,
-            args=(sid, checkout_url, card),
+            args=(sid, checkout_url, card, cart_mode, target_price, watcher_id),
             daemon=True,
         ).start()
