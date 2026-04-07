@@ -6,7 +6,8 @@
   "type": "module",
   "scripts": {
     "start": "node src/ticketAlert.js",
-    "automate": "node src/automation/checkout.js"
+    "automate": "node src/automation/checkout.js",
+    "queue": "node src/automation/queueMonitor.js"
   },
   "dependencies": {
     "axios": "^1.7.2",
