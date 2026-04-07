@@ -25,10 +25,12 @@ load_dotenv(ROOT_DIR / ".env")
 
 try:
     from .scraper import check_url_availability
-    from .autocheckout import trigger_auto_checkout, get_session, inject_otp
+    from .autocheckout import (trigger_auto_checkout, claim_slot,
+                                get_session, get_session_for_device, inject_otp)
 except ImportError:
     from scraper import check_url_availability
-    from autocheckout import trigger_auto_checkout, get_session, inject_otp
+    from autocheckout import (trigger_auto_checkout, claim_slot,
+                               get_session, get_session_for_device, inject_otp)
 
 logging.basicConfig(
     level=logging.INFO,
@@ -514,21 +516,40 @@ def service_worker():
 def manifest():
     return send_from_directory(app.static_folder, "manifest.json")
 
-@app.route("/api/checkout-status/<watcher_id>")
-def checkout_status(watcher_id):
-    """Frontend polls this to know when OTP is required or booking is done."""
-    return jsonify(get_session(watcher_id))
+@app.route("/api/claim-slot", methods=["POST"])
+def api_claim_slot():
+    """
+    A device calls this to claim the next available checkout slot (card).
+    Returns { session_id, card_priority } or { session_id: null } if none free.
+    """
+    body       = request.json or {}
+    watcher_id = body.get("watcher_id", "").strip()
+    device_id  = body.get("device_id",  "").strip()
+    if not watcher_id or not device_id:
+        return jsonify({"error": "watcher_id and device_id are required"}), 400
+    session_id = claim_slot(watcher_id, device_id)
+    if session_id:
+        sess = get_session(session_id)
+        return jsonify({"session_id": session_id,
+                        "card_priority": sess.get("card_priority", 0)})
+    return jsonify({"session_id": None})
+
+
+@app.route("/api/checkout-status/<session_id>")
+def checkout_status(session_id):
+    """Frontend polls this with its session_id to track checkout progress."""
+    return jsonify(get_session(session_id))
 
 
 @app.route("/api/submit-otp", methods=["POST"])
 def submit_otp():
-    """Receives OTP from the user and delivers it to the waiting automation."""
-    body = request.json or {}
-    watcher_id = body.get("watcher_id", "").strip()
-    otp        = body.get("otp", "").strip()
-    if not watcher_id or not otp:
-        return jsonify({"error": "watcher_id and otp are required"}), 400
-    inject_otp(watcher_id, otp)
+    """Receives OTP from the user and delivers it to the correct session."""
+    body       = request.json or {}
+    session_id = body.get("session_id", "").strip()
+    otp        = body.get("otp",        "").strip()
+    if not session_id or not otp:
+        return jsonify({"error": "session_id and otp are required"}), 400
+    inject_otp(session_id, otp)
     return jsonify({"ok": True})
 
 

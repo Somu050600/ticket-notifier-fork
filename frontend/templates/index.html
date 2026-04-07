@@ -1096,26 +1096,36 @@
     }
   }
 
+  // ── Device identity (persisted across page reloads) ──────────────────────────
+  function _getDeviceId() {
+    let id = localStorage.getItem('ta_device_id');
+    if (!id) {
+      id = 'dev-' + Math.random().toString(36).slice(2, 10) + Date.now().toString(36);
+      localStorage.setItem('ta_device_id', id);
+    }
+    return id;
+  }
+  const _deviceId = _getDeviceId();
+
   // ── Alert banner ────────────────────────────────────────────────────────────
-  let _otpWatcherId = null;
+  let _sessionId   = null;   // the session_id claimed by THIS device
   let _otpPollTimer = null;
 
   function showAlertBanner(url, msg, watcherId = null) {
-    document.getElementById('alert-body').textContent = msg;
-    document.getElementById('alert-open-btn').onclick = () => window.open(url, '_blank');
+    document.getElementById('alert-title').textContent = '🟢 TICKETS AVAILABLE!';
+    document.getElementById('alert-body').textContent  = msg;
+    document.getElementById('alert-open-btn').onclick  = () => window.open(url, '_blank');
     document.getElementById('alert-banner').classList.add('show');
     document.getElementById('otp-section').style.display = 'none';
     document.getElementById('otp-status').textContent = '';
     document.getElementById('otp-input').value = '';
+    document.getElementById('otp-input').disabled = false;
 
     playAlarmSound();
     setTimeout(() => closeAlert(), 30000);
 
-    // Begin polling checkout status if we have a watcher id
-    if (watcherId) {
-      _otpWatcherId = watcherId;
-      _startCheckoutStatusPoll(watcherId);
-    }
+    // Claim a slot (card) for this device and start polling
+    if (watcherId) _claimAndPoll(watcherId);
   }
 
   function closeAlert() {
@@ -1124,57 +1134,81 @@
     if (_otpPollTimer) { clearInterval(_otpPollTimer); _otpPollTimer = null; }
   }
 
-  // Poll /api/checkout-status/<id> — shows OTP input when automation is waiting
-  function _startCheckoutStatusPoll(watcherId) {
+  // Claim the next free slot, then start polling that session
+  async function _claimAndPoll(watcherId) {
+    try {
+      const res  = await fetch('/api/claim-slot', {
+        method:  'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body:    JSON.stringify({ watcher_id: watcherId, device_id: _deviceId }),
+      });
+      const data = await res.json();
+      if (data.session_id) {
+        _sessionId = data.session_id;
+        const cardNum = data.card_priority;
+        document.getElementById('alert-body').textContent =
+          `🤖 Auto-checkout started with Card #${cardNum} — standby…`;
+        _startStatusPoll(_sessionId);
+      } else {
+        // No free slot — all cards claimed by other devices
+        document.getElementById('alert-body').textContent =
+          '⚡ All checkout slots claimed by other devices.';
+      }
+    } catch(e) { /* silent */ }
+  }
+
+  // Poll /api/checkout-status/<session_id> every 2 s
+  function _startStatusPoll(sessionId) {
     if (_otpPollTimer) clearInterval(_otpPollTimer);
     _otpPollTimer = setInterval(async () => {
       try {
-        const res  = await fetch(`/api/checkout-status/${watcherId}`);
+        const res  = await fetch(`/api/checkout-status/${sessionId}`);
         const data = await res.json();
+        const card = data.card_priority ? `Card #${data.card_priority}` : 'Card';
 
         if (data.status === 'otp_required') {
           document.getElementById('otp-section').style.display = 'block';
-          document.getElementById('alert-body').textContent =
-            '🤖 Auto-checkout filled your details — enter OTP to confirm:';
           document.getElementById('alert-title').textContent = '🔐 OTP REQUIRED';
-          clearInterval(_otpPollTimer); // stop polling once OTP screen is shown
+          document.getElementById('alert-body').textContent  =
+            `✅ ${card} form filled — enter the OTP sent to your phone:`;
+          clearInterval(_otpPollTimer);
         } else if (data.status === 'success') {
           document.getElementById('otp-section').style.display = 'none';
           document.getElementById('alert-title').textContent = '✅ BOOKED!';
-          document.getElementById('alert-body').textContent  = '🎉 Booking confirmed! Check your email.';
+          document.getElementById('alert-body').textContent  =
+            `🎉 ${card} booking confirmed! Check your email.`;
           clearInterval(_otpPollTimer);
           showToast('🎉 Booking confirmed!', 'success');
         } else if (data.status === 'failed') {
           document.getElementById('otp-section').style.display = 'none';
           document.getElementById('alert-body').textContent  =
-            `⚠️ Auto-checkout failed: ${data.message}. Open the page manually.`;
+            `⚠️ ${card} failed: ${data.message}`;
           clearInterval(_otpPollTimer);
         }
       } catch(e) { /* silent */ }
     }, 2000);
   }
 
-  // Submit OTP typed by the user to the backend
+  // Submit OTP — sends to THIS device's session only
   async function submitOtp() {
-    const otp = document.getElementById('otp-input').value.trim();
+    const otp     = document.getElementById('otp-input').value.trim();
     const statusEl = document.getElementById('otp-status');
-    if (!otp || !_otpWatcherId) return;
+    if (!otp || !_sessionId) return;
 
     statusEl.textContent = 'Submitting OTP…';
     try {
       const res = await fetch('/api/submit-otp', {
         method:  'POST',
         headers: { 'Content-Type': 'application/json' },
-        body:    JSON.stringify({ watcher_id: _otpWatcherId, otp }),
+        body:    JSON.stringify({ session_id: _sessionId, otp }),
       });
       const data = await res.json();
       if (data.ok) {
         statusEl.textContent = '✅ OTP sent — completing booking…';
         document.getElementById('otp-input').disabled = true;
-        // Resume polling to catch success/failed result
-        _startCheckoutStatusPoll(_otpWatcherId);
+        _startStatusPoll(_sessionId);   // resume polling for final result
       } else {
-        statusEl.textContent = '❌ Failed to send OTP — try again.';
+        statusEl.textContent = '❌ Failed — try again.';
       }
     } catch(e) {
       statusEl.textContent = '❌ Network error — try again.';

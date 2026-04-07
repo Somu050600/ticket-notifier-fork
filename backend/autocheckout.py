@@ -1,67 +1,158 @@
 """
-autocheckout.py — Headless auto-checkout for BookMyShow / District.
+autocheckout.py — Multi-card, multi-device headless auto-checkout.
 
-Triggered by the monitor loop when a watcher transitions to "available".
-Fills all details automatically and pauses only at the OTP screen.
-OTP is injected via the /api/submit-otp endpoint (user types it on the
-TicketAlert page — no manual browser interaction needed).
+Card pool (priority order):
+  CARD_1_NUMBER / CARD_1_EXPIRY / CARD_1_CVV / CARD_1_NAME  ← highest priority
+  CARD_2_NUMBER / CARD_2_EXPIRY / CARD_2_CVV / CARD_2_NAME
+  CARD_3_NUMBER / CARD_3_EXPIRY / CARD_3_CVV / CARD_3_NAME
+
+When availability is detected:
+  - One checkout session per configured card is started in parallel.
+  - Each device/browser that opens TicketAlert claims a slot (first-come,
+    first-served) and handles OTP for its assigned card.
+  - Session IDs: "{watcher_id}-slot-{1|2|3}"
 """
 
 import asyncio
 import logging
 import os
 import random
+import threading
 import time
 from typing import Optional
 
 logger = logging.getLogger("ticketalert.checkout")
 
-# ── Shared session state ──────────────────────────────────────────────────────
-# Keyed by watcher_id. Written by this module, read by app.py endpoints.
-#
-# Shape: {
-#   "status":  "running" | "otp_required" | "success" | "failed" | "idle",
-#   "message": str,
-#   "otp":     str | None,          # set externally by /api/submit-otp
-# }
-_sessions: dict = {}
+# ── Card pool ─────────────────────────────────────────────────────────────────
+
+def _load_card_pool() -> list[dict]:
+    """
+    Returns a list of card dicts in priority order (index 0 = highest priority).
+    Falls back to the legacy CARD_NUMBER / CARD_EXPIRY / CARD_CVV env vars for
+    Card 1 if the numbered vars are absent.
+    """
+    pool = []
+    for n in range(1, 4):          # slots 1, 2, 3
+        number = (
+            os.environ.get(f"CARD_{n}_NUMBER") or
+            (os.environ.get("CARD_NUMBER") if n == 1 else "")
+        )
+        expiry = (
+            os.environ.get(f"CARD_{n}_EXPIRY") or
+            (os.environ.get("CARD_EXPIRY") if n == 1 else "")
+        )
+        cvv = (
+            os.environ.get(f"CARD_{n}_CVV") or
+            (os.environ.get("CARD_CVV") if n == 1 else "")
+        )
+        name = (
+            os.environ.get(f"CARD_{n}_NAME") or
+            os.environ.get("PROFILE_NAME", "")
+        )
+        if number:   # only include if a card number is configured
+            pool.append({
+                "priority": n,
+                "number":   number,
+                "expiry":   expiry,
+                "cvv":      cvv,
+                "name":     name,
+            })
+    return pool
 
 
-def get_session(watcher_id: str) -> dict:
-    return _sessions.get(watcher_id, {"status": "idle", "message": "", "otp": None})
-
-
-def inject_otp(watcher_id: str, otp: str):
-    """Called by /api/submit-otp to deliver the OTP to the waiting automation."""
-    if watcher_id in _sessions:
-        _sessions[watcher_id]["otp"] = otp
-        logger.info(f"[{watcher_id}] OTP injected")
-
-
-# ── Profile (from env vars) ───────────────────────────────────────────────────
-
-def _profile():
+def _profile() -> dict:
     return {
-        "name":     os.environ.get("PROFILE_NAME",  ""),
-        "email":    os.environ.get("PROFILE_EMAIL", ""),
-        "phone":    os.environ.get("PROFILE_PHONE", ""),
-        "card_no":  os.environ.get("CARD_NUMBER",   ""),
-        "card_exp": os.environ.get("CARD_EXPIRY",   ""),   # MM/YY
-        "card_cvv": os.environ.get("CARD_CVV",      ""),
+        "name":  os.environ.get("PROFILE_NAME",  ""),
+        "email": os.environ.get("PROFILE_EMAIL", ""),
+        "phone": os.environ.get("PROFILE_PHONE", ""),
     }
 
 
-# ── Selector sets — add/adjust as BookMyShow updates its DOM ─────────────────
+# ── Session state ─────────────────────────────────────────────────────────────
+# Keyed by session_id = "{watcher_id}-slot-{n}"
+#
+# Shape per session:
+# {
+#   "status":    "running"|"otp_required"|"success"|"failed"|"idle",
+#   "message":   str,
+#   "otp":       str | None,   # set by inject_otp() when user submits
+#   "device_id": str | None,   # set by claim_slot()
+#   "card_priority": int,
+# }
+_sessions: dict[str, dict] = {}
+_sessions_lock = threading.Lock()
+
+
+def _session_id(watcher_id: str, priority: int) -> str:
+    return f"{watcher_id}-slot-{priority}"
+
+
+# ── Public API (called from app.py) ──────────────────────────────────────────
+
+def claim_slot(watcher_id: str, device_id: str) -> Optional[str]:
+    """
+    Assigns the next unclaimed active slot to `device_id`.
+    Returns the session_id the device should use, or None if no slot is
+    available (all claimed or no active sessions for this watcher).
+    """
+    with _sessions_lock:
+        # Find the lowest-priority unclaimed session for this watcher
+        for priority in range(1, 4):
+            sid = _session_id(watcher_id, priority)
+            sess = _sessions.get(sid)
+            if sess and sess.get("status") in ("running", "otp_required") \
+                    and sess.get("device_id") is None:
+                sess["device_id"] = device_id
+                logger.info(f"[{sid}] Claimed by device {device_id}")
+                return sid
+        # Already claimed? Let device re-claim its own existing session
+        for priority in range(1, 4):
+            sid = _session_id(watcher_id, priority)
+            sess = _sessions.get(sid)
+            if sess and sess.get("device_id") == device_id:
+                return sid
+    return None
+
+
+def get_session(session_id: str) -> dict:
+    with _sessions_lock:
+        sess = _sessions.get(session_id, {})
+    return {
+        "status":        sess.get("status", "idle"),
+        "message":       sess.get("message", ""),
+        "card_priority": sess.get("card_priority", 0),
+        "device_id":     sess.get("device_id"),
+    }
+
+
+def get_session_for_device(watcher_id: str, device_id: str) -> dict:
+    """Returns the session that belongs to this device, or idle if none."""
+    with _sessions_lock:
+        for priority in range(1, 4):
+            sid = _session_id(watcher_id, priority)
+            sess = _sessions.get(sid)
+            if sess and sess.get("device_id") == device_id:
+                return {**get_session(sid), "session_id": sid}
+    return {"status": "idle", "message": "", "session_id": None}
+
+
+def inject_otp(session_id: str, otp: str):
+    """Delivers OTP from the user to the waiting automation."""
+    with _sessions_lock:
+        if session_id in _sessions:
+            _sessions[session_id]["otp"] = otp
+            logger.info(f"[{session_id}] OTP injected")
+
+
+# ── Checkout coroutine ────────────────────────────────────────────────────────
 
 PROCEED_SELECTORS = [
-    "button[class*='proceed' i]",
-    "button[class*='Proceed' i]",
-    "a[class*='proceed' i]",
     "button:has-text('Proceed')",
     "button:has-text('Continue')",
     "button:has-text('Book')",
+    "button[class*='proceed' i]",
+    "a[class*='proceed' i]",
 ]
-
 OTP_SCREEN_SELECTORS = [
     "input[placeholder*='OTP' i]",
     "input[name*='otp' i]",
@@ -69,105 +160,84 @@ OTP_SCREEN_SELECTORS = [
     "input[autocomplete='one-time-code']",
     "[class*='otp' i] input",
 ]
-
-OTP_URL_PATTERNS = ["otp", "verify", "authenticate", "2fa", "confirm"]
-
-SUCCESS_PATTERNS  = ["confirmed", "success", "booking-confirmed", "thank-you",
-                     "booking confirmed", "order confirmed"]
-FAILURE_PATTERNS  = ["failed", "declined", "error", "invalid", "expired",
-                     "could not", "try again"]
+OTP_URL_PATTERNS  = ["otp", "verify", "authenticate", "2fa", "confirm"]
+SUCCESS_PATTERNS  = ["confirmed", "success", "booking confirmed", "order confirmed", "thank you"]
+FAILURE_PATTERNS  = ["failed", "declined", "error", "invalid", "expired", "try again"]
 
 
-# ── Helpers ───────────────────────────────────────────────────────────────────
-
-async def _rand_delay(lo=0.3, hi=0.9):
+async def _rand(lo=0.3, hi=0.9):
     await asyncio.sleep(random.uniform(lo, hi))
 
 
-async def _safe_fill(page, selector: str, value: str, timeout=6_000):
-    """Fill a field if visible; silent no-op otherwise."""
+async def _fill(scope, selector: str, value: str, timeout=6_000):
     if not value:
         return
     try:
-        loc = page.locator(selector).first
+        loc = scope.locator(selector).first
         await loc.wait_for(state="visible", timeout=timeout)
         await loc.fill(value)
-        await _rand_delay(0.1, 0.3)
+        await _rand(0.1, 0.3)
     except Exception:
         pass
 
 
-async def _safe_click(page, selector: str, timeout=6_000):
+async def _click(page, selector: str, timeout=6_000) -> bool:
     try:
         loc = page.locator(selector).first
         await loc.wait_for(state="visible", timeout=timeout)
-        # Small human-like delay before click
-        await _rand_delay(0.2, 0.5)
+        await _rand(0.2, 0.5)
         await loc.click()
         return True
     except Exception:
         return False
 
 
-async def _click_first_match(page, selectors: list, timeout=8_000) -> bool:
+async def _click_first(page, selectors: list, timeout=8_000) -> bool:
     for sel in selectors:
-        if await _safe_click(page, sel, timeout):
-            logger.info(f"Clicked: {sel}")
+        if await _click(page, sel, timeout):
             return True
     return False
 
 
-async def _scroll_page(page):
-    height = await page.evaluate("document.body.scrollHeight")
-    steps = random.randint(3, 5)
-    for i in range(1, steps + 1):
-        await page.evaluate(f"window.scrollTo(0, {int(height * i / steps)})")
-        await _rand_delay(0.2, 0.5)
-
-
-# ── OTP gate ──────────────────────────────────────────────────────────────────
-
-async def _wait_for_otp(watcher_id: str, timeout_s=300) -> Optional[str]:
-    """
-    Poll _sessions[watcher_id]['otp'] until it is set or timeout expires.
-    Returns the OTP string or None on timeout.
-    """
-    deadline = time.time() + timeout_s
-    while time.time() < deadline:
-        otp = _sessions.get(watcher_id, {}).get("otp")
-        if otp:
-            return otp
-        await asyncio.sleep(2)
-    return None
-
-
 async def _is_otp_screen(page) -> bool:
-    url = page.url.lower()
-    if any(p in url for p in OTP_URL_PATTERNS):
+    if any(p in page.url.lower() for p in OTP_URL_PATTERNS):
         return True
     for sel in OTP_SCREEN_SELECTORS:
         try:
-            el = page.locator(sel).first
-            if await el.is_visible(timeout=1_500):
+            if await page.locator(sel).first.is_visible(timeout=1_500):
                 return True
         except Exception:
             pass
     return False
 
 
-# ── Main checkout coroutine ───────────────────────────────────────────────────
+async def _wait_for_otp(session_id: str, timeout_s=300) -> Optional[str]:
+    deadline = time.time() + timeout_s
+    while time.time() < deadline:
+        with _sessions_lock:
+            otp = _sessions.get(session_id, {}).get("otp")
+        if otp:
+            return otp
+        await asyncio.sleep(2)
+    return None
 
-async def _run_checkout(watcher_id: str, checkout_url: str):
+
+def _update(session_id: str, **kwargs):
+    with _sessions_lock:
+        if session_id in _sessions:
+            _sessions[session_id].update(kwargs)
+
+
+async def _run_checkout(session_id: str, checkout_url: str, card: dict):
     try:
-        from playwright.async_api import async_playwright, TimeoutError as PWTimeout
+        from playwright.async_api import async_playwright
     except ImportError:
-        logger.error("Playwright not available — cannot auto-checkout")
-        _sessions[watcher_id]["status"]  = "failed"
-        _sessions[watcher_id]["message"] = "Playwright not installed"
+        logger.error("Playwright not installed")
+        _update(session_id, status="failed", message="Playwright not installed")
         return
 
     profile = _profile()
-    _sessions[watcher_id] = {"status": "running", "message": "Starting checkout…", "otp": None}
+    _update(session_id, status="running", message="Starting checkout…")
 
     async with async_playwright() as pw:
         browser = await pw.chromium.launch(
@@ -179,7 +249,7 @@ async def _run_checkout(watcher_id: str, checkout_url: str):
                 "--disable-gpu",
             ],
         )
-        context = await browser.new_context(
+        ctx = await browser.new_context(
             user_agent=(
                 "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
                 "AppleWebKit/537.36 (KHTML, like Gecko) "
@@ -188,95 +258,90 @@ async def _run_checkout(watcher_id: str, checkout_url: str):
             viewport={"width": 1280, "height": 800},
             locale="en-IN",
             timezone_id="Asia/Kolkata",
-            extra_http_headers={
-                "Accept-Language": "en-IN,en;q=0.9",
-                "DNT": "1",
-            },
         )
-        await context.add_init_script("""
+        await ctx.add_init_script("""
             Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
             Object.defineProperty(navigator, 'plugins',   { get: () => [1,2,3,4,5] });
             window.chrome = { runtime: {} };
         """)
-
-        page = await context.new_page()
+        page = await ctx.new_page()
 
         try:
             # ── 1. Navigate ───────────────────────────────────────────────────
-            logger.info(f"[{watcher_id}] Navigating to {checkout_url}")
-            _sessions[watcher_id]["message"] = "Navigating to checkout…"
+            logger.info(f"[{session_id}] Navigating → {checkout_url}")
+            _update(session_id, message="Navigating…")
             await page.goto(checkout_url, wait_until="domcontentloaded", timeout=30_000)
             await page.wait_for_load_state("networkidle", timeout=10_000)
-            await _scroll_page(page)
 
-            # ── 2. Seat / quantity selection (BookMyShow step) ────────────────
-            _sessions[watcher_id]["message"] = "Selecting seats…"
-            # Try clicking the best/cheapest available seat category
-            seat_selectors = [
+            # ── 2. Seat / quantity selection ──────────────────────────────────
+            _update(session_id, message="Selecting seats…")
+            for sel in [
                 "[class*='price-card']:not([class*='sold-out']):first-child",
                 "[class*='category']:not([class*='disabled']):first-child",
-                "[class*='ticket-type']:first-child",
                 "li[class*='list']:not([class*='sold']):first-child",
-            ]
-            for sel in seat_selectors:
-                if await _safe_click(page, sel, timeout=4_000):
-                    await _rand_delay(0.5, 1.0)
+            ]:
+                if await _click(page, sel, timeout=3_000):
+                    await _rand(0.4, 0.8)
                     break
 
-            # Quantity: try to set max allowed (up to 6 on BMS)
-            qty_selectors = [
-                "select[id*='qty']", "select[name*='qty']",
-                "input[type='number']",
-                "[class*='quantity'] select",
-            ]
-            for sel in qty_selectors:
+            # Set max quantity
+            for sel in ["select[id*='qty']", "select[name*='qty']",
+                        "input[type='number']", "[class*='quantity'] select"]:
                 try:
                     loc = page.locator(sel).first
-                    if await loc.is_visible(timeout=3_000):
-                        # Try to select max value
+                    if await loc.is_visible(timeout=2_000):
                         opts = await loc.evaluate(
-                            "el => [...el.options || []].map(o => o.value)"
+                            "el => [...(el.options||[])].map(o=>o.value)"
                         )
                         if opts:
                             await loc.select_option(opts[-1])
-                        await _rand_delay(0.3, 0.6)
+                        await _rand(0.2, 0.5)
                         break
                 except Exception:
                     pass
 
-            # Click Proceed / Book
-            await _click_first_match(page, PROCEED_SELECTORS)
-            await _rand_delay(1.0, 2.0)
+            await _click_first(page, PROCEED_SELECTORS)
+            await _rand(1.0, 2.0)
             await page.wait_for_load_state("domcontentloaded", timeout=15_000)
 
-            # ── 3. Fill personal details ──────────────────────────────────────
-            _sessions[watcher_id]["message"] = "Filling personal details…"
-            await _safe_fill(page, "input[name*='name' i], input[id*='name' i], input[placeholder*='name' i]",  profile["name"])
-            await _safe_fill(page, "input[type='email'], input[name*='email' i]",                                profile["email"])
-            await _safe_fill(page, "input[type='tel'],   input[name*='phone' i], input[name*='mobile' i]",       profile["phone"])
+            # ── 3. Personal details ───────────────────────────────────────────
+            _update(session_id, message="Filling personal details…")
+            await _fill(page, "input[name*='name' i], input[placeholder*='name' i]", profile["name"])
+            await _fill(page, "input[type='email'], input[name*='email' i]",          profile["email"])
+            await _fill(page, "input[type='tel'],   input[name*='phone' i]",          profile["phone"])
 
-            # ── 4. Fill payment details ───────────────────────────────────────
-            _sessions[watcher_id]["message"] = "Filling payment details…"
-            # Try inline card fields first
-            await _safe_fill(page, "input[name*='card' i][name*='number' i], input[placeholder*='card number' i]", profile["card_no"])
-            await _safe_fill(page, "input[name*='expiry' i], input[placeholder*='MM/YY' i], input[name*='exp' i]", profile["card_exp"])
-            await _safe_fill(page, "input[name*='cvv' i], input[placeholder*='CVV' i], input[name*='cvc' i]",      profile["card_cvv"])
-
-            # Try payment iframe (Razorpay / Stripe style)
+            # ── 4. Card details (THIS session's assigned card) ────────────────
+            _update(session_id, message=f"Filling card #{card['priority']}…")
+            await _fill(
+                page,
+                "input[name*='card'][name*='number' i], input[placeholder*='card number' i]",
+                card["number"],
+            )
+            await _fill(
+                page,
+                "input[name*='expiry' i], input[placeholder*='MM/YY' i]",
+                card["expiry"],
+            )
+            await _fill(
+                page,
+                "input[name*='cvv' i], input[placeholder*='CVV' i]",
+                card["cvv"],
+            )
+            # Payment iframes (Razorpay / Stripe)
             for iframe_sel in ["iframe[src*='razorpay']", "iframe[src*='stripe']",
                                "iframe[name*='card']",    "iframe[title*='payment' i]"]:
                 try:
-                    await page.wait_for_selector(iframe_sel, timeout=4_000)
+                    await page.wait_for_selector(iframe_sel, timeout=3_000)
                     f = page.frame_locator(iframe_sel)
-                    await _safe_fill(f, "input[name*='number' i], input[placeholder*='Card number' i]", profile["card_no"])
-                    await _safe_fill(f, "input[name*='expiry' i], input[placeholder*='MM' i]",          profile["card_exp"])
-                    await _safe_fill(f, "input[name*='cvv' i], input[placeholder*='CVV' i]",            profile["card_cvv"])
+                    await _fill(f, "input[name*='number' i], input[placeholder*='Card number' i]", card["number"])
+                    await _fill(f, "input[name*='expiry' i], input[placeholder*='MM' i]",          card["expiry"])
+                    await _fill(f, "input[name*='cvv' i],    input[placeholder*='CVV' i]",          card["cvv"])
                     break
                 except Exception:
                     pass
 
-            # Click confirm / pay
-            await _click_first_match(page, [
+            # ── 5. Click Pay ──────────────────────────────────────────────────
+            await _click_first(page, [
                 "button:has-text('Pay Now')",
                 "button:has-text('Confirm')",
                 "button:has-text('Place Order')",
@@ -284,82 +349,105 @@ async def _run_checkout(watcher_id: str, checkout_url: str):
                 "button[class*='confirm' i]",
                 "button[type='submit']",
             ])
-            await _rand_delay(1.5, 3.0)
+            await _rand(1.5, 3.0)
             await page.wait_for_load_state("domcontentloaded", timeout=15_000)
 
-            # ── 5. OTP gate ───────────────────────────────────────────────────
+            # ── 6. OTP gate ───────────────────────────────────────────────────
             if await _is_otp_screen(page):
-                logger.info(f"[{watcher_id}] OTP screen detected — waiting for user input")
-                _sessions[watcher_id]["status"]  = "otp_required"
-                _sessions[watcher_id]["message"] = "Enter OTP on TicketAlert to complete booking"
+                logger.info(f"[{session_id}] OTP screen — waiting for user input")
+                _update(
+                    session_id,
+                    status="otp_required",
+                    message=f"Card #{card['priority']} — enter OTP to confirm",
+                )
 
-                otp = await _wait_for_otp(watcher_id, timeout_s=300)
+                otp = await _wait_for_otp(session_id, timeout_s=300)
                 if not otp:
                     raise TimeoutError("OTP not received within 5 minutes")
 
-                logger.info(f"[{watcher_id}] OTP received — submitting")
-                _sessions[watcher_id]["message"] = "Submitting OTP…"
-
-                # Fill OTP field
+                _update(session_id, message="Submitting OTP…")
                 for sel in OTP_SCREEN_SELECTORS:
                     try:
                         loc = page.locator(sel).first
                         if await loc.is_visible(timeout=2_000):
                             await loc.fill(otp)
-                            await _rand_delay(0.3, 0.7)
+                            await _rand(0.3, 0.7)
                             break
                     except Exception:
                         pass
 
-                # Submit
-                await _click_first_match(page, [
+                await _click_first(page, [
                     "button:has-text('Submit')",
                     "button:has-text('Verify')",
                     "button:has-text('Confirm')",
                     "button[type='submit']",
                 ])
-                await _rand_delay(2.0, 4.0)
+                await _rand(2.0, 4.0)
                 await page.wait_for_load_state("networkidle", timeout=15_000)
 
-            # ── 6. Determine outcome ──────────────────────────────────────────
-            final_url  = page.url.lower()
-            final_text = (await page.text_content("body") or "").lower()
+            # ── 7. Outcome ────────────────────────────────────────────────────
+            body = (await page.text_content("body") or "").lower()
+            url  = page.url.lower()
 
-            if any(p in final_url or p in final_text for p in SUCCESS_PATTERNS):
-                _sessions[watcher_id]["status"]  = "success"
-                _sessions[watcher_id]["message"] = "Booking confirmed!"
-                logger.info(f"[{watcher_id}] BOOKING CONFIRMED")
+            if any(p in url or p in body for p in SUCCESS_PATTERNS):
+                _update(session_id, status="success",
+                        message=f"Card #{card['priority']} — Booking confirmed!")
+                logger.info(f"[{session_id}] CONFIRMED")
             else:
-                failed_reason = next((p for p in FAILURE_PATTERNS if p in final_text), "unknown")
-                _sessions[watcher_id]["status"]  = "failed"
-                _sessions[watcher_id]["message"] = f"Booking failed ({failed_reason})"
-                logger.warning(f"[{watcher_id}] Booking failed — {failed_reason}")
+                reason = next((p for p in FAILURE_PATTERNS if p in body), "unknown")
+                _update(session_id, status="failed",
+                        message=f"Card #{card['priority']} failed ({reason})")
+                logger.warning(f"[{session_id}] failed — {reason}")
 
         except Exception as e:
-            logger.error(f"[{watcher_id}] Checkout error: {e}")
-            _sessions[watcher_id]["status"]  = "failed"
-            _sessions[watcher_id]["message"] = str(e)
+            logger.error(f"[{session_id}] error: {e}")
+            _update(session_id, status="failed", message=str(e))
         finally:
-            await context.close()
+            await ctx.close()
             await browser.close()
 
 
-# ── Public entry point (called from app.py in a thread) ──────────────────────
+# ── Thread entry point ────────────────────────────────────────────────────────
 
-def trigger_auto_checkout(watcher_id: str, checkout_url: str):
-    """
-    Spawn the checkout coroutine in its own event loop (called from a
-    daemon thread so it doesn't block the Flask server).
-    """
-    if _sessions.get(watcher_id, {}).get("status") in ("running", "otp_required"):
-        logger.info(f"[{watcher_id}] Checkout already in progress — skipping")
-        return
-
-    logger.info(f"[{watcher_id}] Triggering auto-checkout for {checkout_url}")
-
+def _run_in_thread(session_id: str, checkout_url: str, card: dict):
     loop = asyncio.new_event_loop()
     asyncio.set_event_loop(loop)
     try:
-        loop.run_until_complete(_run_checkout(watcher_id, checkout_url))
+        loop.run_until_complete(_run_checkout(session_id, checkout_url, card))
     finally:
         loop.close()
+
+
+def trigger_auto_checkout(watcher_id: str, checkout_url: str):
+    """
+    Starts one checkout thread per configured card (highest priority first).
+    Already-running sessions for this watcher are not restarted.
+    """
+    pool = _load_card_pool()
+    if not pool:
+        logger.warning("No cards configured — set CARD_1_NUMBER etc. in env vars")
+        return
+
+    for card in pool:
+        sid = _session_id(watcher_id, card["priority"])
+
+        with _sessions_lock:
+            existing = _sessions.get(sid, {}).get("status")
+            if existing in ("running", "otp_required"):
+                logger.info(f"[{sid}] Already running — skipping")
+                continue
+            # Initialise the slot
+            _sessions[sid] = {
+                "status":        "running",
+                "message":       "Starting…",
+                "otp":           None,
+                "device_id":     None,
+                "card_priority": card["priority"],
+            }
+
+        logger.info(f"[{sid}] Launching checkout with card #{card['priority']}")
+        threading.Thread(
+            target=_run_in_thread,
+            args=(sid, checkout_url, card),
+            daemon=True,
+        ).start()
