@@ -353,7 +353,7 @@ def apply_check_result(watcher, result):
     status = result["status"]
     prev_status = watcher.get("last_status")
 
-    if result.get("name") and watcher.get("name") in ("", "Checking…", "Checkingâ€¦", None):
+    if result.get("name") and watcher.get("name") in ("", "Checking\u2026", "Checking...", None):
         watcher["name"] = result["name"]
 
     watcher.update({

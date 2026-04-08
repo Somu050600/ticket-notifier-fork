@@ -1040,12 +1040,13 @@ async def _wait_for_otp(session_id: str, timeout_s=300) -> Optional[str]:
 
 def _notify_cart_ready(watcher_id: str, cart_url: str):
     """Posts cart URL back to Flask so it can push-notify the user."""
+    port = os.environ.get("PORT", "8000")
     try:
         import requests as req
         req.post(
-            f"http://localhost:{os.environ.get('PORT', 5000)}/api/watchers/{watcher_id}/cart-url",
+            f"http://127.0.0.1:{port}/api/watchers/{watcher_id}/cart-url",
             json={"cart_url": cart_url},
-            timeout=5,
+            timeout=10,
         )
     except Exception as e:
         logger.warning(f"Could not notify cart URL: {e}")
@@ -1083,6 +1084,19 @@ def _derive_buytickets_url(event_url: str) -> str:
     return event_url
 
 
+def _cleanup_stale_sessions(max_age_s=1800):
+    """Remove sessions older than max_age_s (default 30 min) to prevent memory leaks."""
+    now = time.time()
+    with _sessions_lock:
+        stale = [sid for sid, s in _sessions.items()
+                 if now - s.get("created_at", now) > max_age_s
+                 and s.get("status") not in ("running", "otp_required")]
+        for sid in stale:
+            del _sessions[sid]
+    if stale:
+        logger.info(f"Cleaned up {len(stale)} stale sessions")
+
+
 def trigger_auto_checkout(watcher_id: str, checkout_url: str,
                           cart_mode: bool = True,
                           target_price: str = "",
@@ -1093,26 +1107,19 @@ def trigger_auto_checkout(watcher_id: str, checkout_url: str,
                       and send the direct booking link for the user to open.
     cart_mode=False → full checkout including card fill and OTP (needs cards).
     """
+    _cleanup_stale_sessions()
     pool = _load_card_pool()
 
     if cart_mode:
         sid = _session_id(watcher_id, 1)
+        cart_url = _derive_buytickets_url(checkout_url)
 
         with _sessions_lock:
             existing = _sessions.get(sid, {}).get("status")
             if existing in ("running", "otp_required", "cart_ready"):
                 logger.info(f"[{sid}] Already running — skipping")
                 return
-
-        # ── INSTANT cart mode: derive the buytickets URL and send it ──
-        # BookMyShow blocks headless browsers on Railway, so instead of
-        # trying (and failing) to automate the checkout, we immediately
-        # send the user the direct booking link. They open it on their
-        # device → qty popup → stadium map → select seats → pay.
-        cart_url = _derive_buytickets_url(checkout_url)
-        logger.info(f"[{sid}] CART MODE — sending buytickets URL: {cart_url}")
-
-        with _sessions_lock:
+            # Set session atomically (no gap between check and set)
             _sessions[sid] = {
                 "status":        "cart_ready",
                 "message":       "Booking link ready — open and select seats!",
@@ -1121,9 +1128,10 @@ def trigger_auto_checkout(watcher_id: str, checkout_url: str,
                 "card_priority": 1,
                 "cart_url":      cart_url,
                 "cart_mode":     True,
+                "created_at":    time.time(),
             }
 
-        # Notify the user immediately
+        logger.info(f"[{sid}] CART MODE — sending buytickets URL: {cart_url}")
         _notify_cart_ready(watcher_id, cart_url)
         return
 
@@ -1148,6 +1156,7 @@ def trigger_auto_checkout(watcher_id: str, checkout_url: str,
                 "card_priority": card["priority"],
                 "cart_url":      None,
                 "cart_mode":     False,
+                "created_at":    time.time(),
             }
 
         logger.info(f"[{sid}] Launching FULL CHECKOUT with card #{card['priority']}"
