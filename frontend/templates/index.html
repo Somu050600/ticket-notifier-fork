@@ -758,10 +758,10 @@
     <div class="alert-title" id="alert-title">🟢 TICKETS AVAILABLE!</div>
     <div class="alert-body" id="alert-body">Tickets found for an event you're watching!</div>
 
-    <!-- Cart-ready section — shown when bot has added to cart -->
+    <!-- Cart-ready section — shown when tickets are live -->
     <div id="cart-section" style="display:none; margin-bottom:12px;">
       <div style="font-size:12px; color:#aaffcc; margin-bottom:8px;">
-        🛒 Seats selected and added to cart - tap below to pay now:
+        🎫 Tickets are LIVE! Tap below to open the booking page:
       </div>
       <a id="cart-pay-btn" href="#" target="_blank" rel="noopener"
          onclick="return handleCartPayClick(event)"
@@ -769,12 +769,12 @@
                 background:linear-gradient(135deg,#7c3aed,#a855f7); color:#fff;
                 font-weight:700; font-size:16px; text-decoration:none; letter-spacing:.3px;
                 box-shadow: 0 6px 20px rgba(124,58,237,.4);">
-        💳 Complete Payment →
+        🎫 Book Tickets Now →
       </a>
       <div id="cart-url-display" style="font-size:10px; color:#88cc99; margin-top:6px;
            text-align:center; word-break:break-all; opacity:.7;"></div>
       <div style="font-size:11px; color:#ffcc00; margin-top:4px; text-align:center; font-weight:600;">
-        ⏱ Link expires soon - pay immediately!
+        ⚡ Opens seat selection directly - be fast!
       </div>
     </div>
 
@@ -1322,13 +1322,13 @@
         }
 
         if (data.status === 'cart_ready') {
-          // Bot added to cart — show the pay button with the cart URL
+          // Tickets are live — show booking link
           const cartUrl = data.cart_url || '';
           document.getElementById('cart-section').style.display = 'block';
           document.getElementById('otp-section').style.display  = 'none';
-          document.getElementById('alert-title').textContent = 'CART READY - PAY NOW!';
+          document.getElementById('alert-title').textContent = 'TICKETS LIVE - BOOK NOW!';
           document.getElementById('alert-body').textContent  =
-            `${card}: seats selected and added to cart`;
+            'Tap below to open seat selection and book your tickets!';
 
           if (cartUrl) {
             document.getElementById('cart-pay-btn').href = cartUrl;

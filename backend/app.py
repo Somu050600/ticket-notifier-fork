@@ -616,8 +616,8 @@ def _send_cart_notification(watcher, cart_url):
     data = load_data()
     payload = {
         "type":              "CART_READY",
-        "title":             "CART READY - Complete Payment!",
-        "body":              f"{watcher['name']} - Your cart is reserved. Tap to pay now.",
+        "title":             "TICKETS LIVE - Book Now!",
+        "body":              f"{watcher['name']} - Tap to open booking page and grab your seats!",
         "url":               cart_url,
         "alarm":             True,
         "requireInteraction": True,

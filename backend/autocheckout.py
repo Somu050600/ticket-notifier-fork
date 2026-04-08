@@ -1068,18 +1068,34 @@ def _run_in_thread(session_id: str, checkout_url: str, card: dict,
         loop.close()
 
 
+def _derive_buytickets_url(event_url: str) -> str:
+    """
+    Convert any BMS event URL to the buytickets entry point.
+    /sports/slug/ETXXXXXX  →  /buytickets/slug/ETXXXXXX
+    """
+    import re
+    m = re.search(r'in\.bookmyshow\.com/(?:sports|events)/([^?#]+)', event_url)
+    if m:
+        slug = m.group(1).rstrip('/')
+        return f"https://in.bookmyshow.com/buytickets/{slug}"
+    if 'buytickets' in event_url:
+        return event_url
+    return event_url
+
+
 def trigger_auto_checkout(watcher_id: str, checkout_url: str,
                           cart_mode: bool = True,
                           target_price: str = "",
                           owner_email: str = ""):
     """
-    cart_mode=True  → select seats, add to cart, send URL (NO card needed).
+    cart_mode=True  → instantly derive buytickets URL and send to user.
+                      BookMyShow blocks headless browsers, so we skip Playwright
+                      and send the direct booking link for the user to open.
     cart_mode=False → full checkout including card fill and OTP (needs cards).
     """
     pool = _load_card_pool()
 
     if cart_mode:
-        dummy_card = pool[0] if pool else {"priority": 1, "number": "", "expiry": "", "cvv": "", "name": ""}
         sid = _session_id(watcher_id, 1)
 
         with _sessions_lock:
@@ -1087,23 +1103,28 @@ def trigger_auto_checkout(watcher_id: str, checkout_url: str,
             if existing in ("running", "otp_required", "cart_ready"):
                 logger.info(f"[{sid}] Already running — skipping")
                 return
+
+        # ── INSTANT cart mode: derive the buytickets URL and send it ──
+        # BookMyShow blocks headless browsers on Railway, so instead of
+        # trying (and failing) to automate the checkout, we immediately
+        # send the user the direct booking link. They open it on their
+        # device → qty popup → stadium map → select seats → pay.
+        cart_url = _derive_buytickets_url(checkout_url)
+        logger.info(f"[{sid}] CART MODE — sending buytickets URL: {cart_url}")
+
+        with _sessions_lock:
             _sessions[sid] = {
-                "status":        "running",
-                "message":       "Starting cart-add...",
+                "status":        "cart_ready",
+                "message":       "Booking link ready — open and select seats!",
                 "otp":           None,
                 "device_id":     None,
                 "card_priority": 1,
-                "cart_url":      None,
+                "cart_url":      cart_url,
                 "cart_mode":     True,
             }
 
-        logger.info(f"[{sid}] Launching CART MODE"
-                    + (f" targeting Rs.{target_price}" if target_price else ""))
-        threading.Thread(
-            target=_run_in_thread,
-            args=(sid, checkout_url, dummy_card, True, target_price, watcher_id),
-            daemon=True,
-        ).start()
+        # Notify the user immediately
+        _notify_cart_ready(watcher_id, cart_url)
         return
 
     # Full checkout mode
