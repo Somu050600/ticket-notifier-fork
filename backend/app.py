@@ -244,6 +244,7 @@ def _derive_checkout_url(event_url: str) -> str:
     """
     Auto-generate a BookMyShow buytickets URL from an event URL.
     /sports/event-name/ET001234  →  /buytickets/event-name/ET001234
+    This is the seat selection entry point (qty popup → stadium map).
     Falls back to the original URL if not a recognizable pattern.
     """
     import re
@@ -252,6 +253,12 @@ def _derive_checkout_url(event_url: str) -> str:
     if m:
         slug = m.group(1).rstrip('/')
         return f"https://in.bookmyshow.com/buytickets/{slug}"
+    # Already a buytickets URL — keep it
+    if 'buytickets' in event_url:
+        return event_url
+    # District.in — keep as-is
+    if 'district.in' in event_url:
+        return event_url
     return event_url
 
 
@@ -609,8 +616,8 @@ def _send_cart_notification(watcher, cart_url):
     data = load_data()
     payload = {
         "type":              "CART_READY",
-        "title":             "🛒 Cart Ready — Complete Payment!",
-        "body":              f"{watcher['name']} — Your cart is reserved. Tap to pay now.",
+        "title":             "CART READY - Complete Payment!",
+        "body":              f"{watcher['name']} - Your cart is reserved. Tap to pay now.",
         "url":               cart_url,
         "alarm":             True,
         "requireInteraction": True,

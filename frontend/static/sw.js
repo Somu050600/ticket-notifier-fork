@@ -1,8 +1,7 @@
 // TicketAlert Service Worker
 // Handles Web Push notifications with alarm behaviour
 
-const CACHE_NAME = "ticketalert-v1";
-const ALARM_ASSETS = ["/", "/static/alarm.mp3"];
+const CACHE_NAME = "ticketalert-v2";
 
 self.addEventListener("install", (event) => {
   self.skipWaiting();
@@ -26,8 +25,8 @@ self.addEventListener("push", (event) => {
     payload = { title: "TicketAlert", body: event.data.text() };
   }
 
-  const isAlarm = payload.alarm === true || payload.type === "AVAILABLE";
-  const isTest  = payload.type === "TEST";
+  const isAlarm    = payload.alarm === true || payload.type === "AVAILABLE";
+  const isCartReady = payload.type === "CART_READY";
 
   // Build notification options
   const options = {
@@ -35,13 +34,21 @@ self.addEventListener("push", (event) => {
     icon: payload.icon || "/static/icon-192.png",
     badge: payload.badge || "/static/badge.png",
     tag: payload.tag || "ticketalert",
-    data: { url: payload.url || "/" },
-    requireInteraction: payload.requireInteraction || isAlarm,
+    data: {
+      url: payload.url || "/",
+      type: payload.type || "UNKNOWN",
+    },
+    requireInteraction: payload.requireInteraction || isAlarm || isCartReady,
     silent: false,
     vibrate: payload.vibrate || (isAlarm ? [300, 100, 300, 100, 300, 100, 600] : [200]),
-    actions: isAlarm
+    actions: isCartReady
       ? [
-          { action: "open",    title: "🎫 Open Page" },
+          { action: "pay",     title: "Complete Payment" },
+          { action: "dismiss", title: "Dismiss" },
+        ]
+      : isAlarm
+      ? [
+          { action: "open",    title: "Open Page" },
           { action: "dismiss", title: "Dismiss" },
         ]
       : [{ action: "open", title: "View" }],
@@ -58,21 +65,21 @@ self.addEventListener("notificationclick", (event) => {
 
   if (event.action === "dismiss") return;
 
-  const url = event.notification.data?.url || "/";
+  const url  = event.notification.data?.url || "/";
+  const type = event.notification.data?.type || "";
 
-  // Determine whether the target is external (e.g. BookMyShow checkout URL)
-  // or internal (the TicketAlert app itself).
+  // For CART_READY and AVAILABLE — always open the target URL in a new tab
+  // These are external BookMyShow/District URLs that need their own tab
   const isExternal = url.startsWith("http") && !url.includes(self.location.hostname);
+  const forceNewTab = type === "CART_READY" || type === "AVAILABLE" || isExternal;
 
   event.waitUntil(
     clients.matchAll({ type: "window", includeUncontrolled: true }).then((clientList) => {
-      // For external URLs (checkout pages) always open a new tab so the user
-      // lands directly on the booking page — never reuse the TicketAlert tab.
-      if (isExternal) {
-        // Also notify any open TicketAlert tab so the banner shows there too
+      if (forceNewTab) {
+        // Notify any open TicketAlert tab so the banner shows there too
         for (const client of clientList) {
           if (client.url.includes(self.location.hostname)) {
-            client.postMessage({ type: "TICKET_AVAILABLE", url });
+            client.postMessage({ type: "TICKET_AVAILABLE", url, notificationType: type });
           }
         }
         return clients.openWindow(url);
@@ -86,7 +93,6 @@ self.addEventListener("notificationclick", (event) => {
           return;
         }
       }
-      // Otherwise open new tab
       if (clients.openWindow) {
         return clients.openWindow(url);
       }
@@ -94,7 +100,7 @@ self.addEventListener("notificationclick", (event) => {
   );
 });
 
-// ── Background sync (re-check on network restore) ────────────────────────────
+// ── Background sync ─────────────────────────────────────────────────────────
 self.addEventListener("sync", (event) => {
   if (event.tag === "sync-watchers") {
     event.waitUntil(fetch("/api/stats").catch(() => {}));

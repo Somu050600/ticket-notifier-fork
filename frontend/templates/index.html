@@ -534,6 +534,45 @@
 </head>
 <body>
 
+  <!-- ── LOGIN GATE (full-screen overlay) ── -->
+  <div id="login-gate" style="
+    position:fixed; inset:0; z-index:9999;
+    background: linear-gradient(135deg, #1a0533 0%, #0f0a1e 50%, #1a0533 100%);
+    display:flex; flex-direction:column; align-items:center; justify-content:center;
+    text-align:center; padding:24px;
+  ">
+    <div style="
+      background: linear-gradient(135deg, var(--accent), var(--accent2));
+      width:80px; height:80px; border-radius:20px;
+      display:flex; align-items:center; justify-content:center;
+      font-size:40px; margin-bottom:28px;
+      box-shadow: 0 20px 50px rgba(124,58,237,.4);
+    ">🔔</div>
+    <h1 style="color:#fff; font-family:var(--font-display); font-size:clamp(32px,5vw,48px);
+      font-weight:800; letter-spacing:-1.5px; margin-bottom:12px;">
+      Ticket<span style="color:var(--accent2);">Alert</span>
+    </h1>
+    <p style="color:rgba(255,255,255,.55); font-size:15px; max-width:400px; margin-bottom:36px; line-height:1.6;">
+      Get instant alarm alerts the moment tickets go live on BookMyShow or District.
+      Sign in to start watching events.
+    </p>
+    <a href="/auth/login" style="
+      display:inline-flex; align-items:center; gap:10px;
+      padding:14px 32px; background:#fff; border-radius:12px;
+      font-family:var(--font-display); font-size:15px; font-weight:700;
+      color:#1f1638; text-decoration:none;
+      box-shadow: 0 8px 24px rgba(0,0,0,.25);
+      transition: all .2s;
+    ">
+      <img src="https://www.gstatic.com/firebasejs/ui/2.0.0/images/auth/google.svg"
+           style="width:20px;height:20px;">
+      Sign in with Google
+    </a>
+    <p style="color:rgba(255,255,255,.3); font-size:11px; margin-top:20px;">
+      Your watchers are private and tied to your Google account
+    </p>
+  </div>
+
   <header>
     <div class="logo">
       <div class="logo-icon">🔔</div>
@@ -722,16 +761,20 @@
     <!-- Cart-ready section — shown when bot has added to cart -->
     <div id="cart-section" style="display:none; margin-bottom:12px;">
       <div style="font-size:12px; color:#aaffcc; margin-bottom:8px;">
-        🛒 Seats selected &amp; added to cart — tap below to pay now:
+        🛒 Seats selected and added to cart - tap below to pay now:
       </div>
       <a id="cart-pay-btn" href="#" target="_blank" rel="noopener"
-         style="display:block; text-align:center; padding:12px; border-radius:10px;
+         onclick="return handleCartPayClick(event)"
+         style="display:block; text-align:center; padding:14px; border-radius:10px;
                 background:linear-gradient(135deg,#7c3aed,#a855f7); color:#fff;
-                font-weight:700; font-size:15px; text-decoration:none; letter-spacing:.3px;">
+                font-weight:700; font-size:16px; text-decoration:none; letter-spacing:.3px;
+                box-shadow: 0 6px 20px rgba(124,58,237,.4);">
         💳 Complete Payment →
       </a>
-      <div style="font-size:11px; color:#88cc99; margin-top:6px; text-align:center;">
-        Link expires soon — pay immediately
+      <div id="cart-url-display" style="font-size:10px; color:#88cc99; margin-top:6px;
+           text-align:center; word-break:break-all; opacity:.7;"></div>
+      <div style="font-size:11px; color:#ffcc00; margin-top:4px; text-align:center; font-weight:600;">
+        ⏱ Link expires soon - pay immediately!
       </div>
     </div>
 
@@ -765,27 +808,36 @@
   const VAPID_PUBLIC_KEY = "{{ vapid_public_key }}";
   const PROFILE_STORAGE_KEY = 'ticketalert.checkoutProfile';
 
-  // ── Google auth UI ───────────────────────────────────────────────────────────
+  // ── Google auth UI + Login Gate ──────────────────────────────────────────────
+  let _isLoggedIn = false;
+
   (async function initAuth() {
+    const loginGate = document.getElementById('login-gate');
     try {
       const res  = await fetch('/auth/me');
       const user = await res.json();
       if (user && user.email) {
+        _isLoggedIn = true;
+        // Hide login gate, show app
+        loginGate.style.display = 'none';
         document.getElementById('login-btn').style.display  = 'none';
         document.getElementById('user-pill').style.display  = 'flex';
         document.getElementById('user-name').textContent    = user.name || user.email;
         document.getElementById('user-avatar').src          = user.picture || '';
       } else {
+        // Show login gate
+        loginGate.style.display = 'flex';
         document.getElementById('login-btn').style.display  = 'flex';
         document.getElementById('user-pill').style.display  = 'none';
       }
     } catch(e) {
+      loginGate.style.display = 'flex';
       document.getElementById('login-btn').style.display = 'flex';
     }
     // Show success/error toast from OAuth redirect
     const p = new URLSearchParams(location.search);
-    if (p.get('auth') === 'success') showToast('✅ Signed in with Google!', 'success');
-    if (p.get('auth') === 'error')   showToast('❌ Google sign-in failed', 'error');
+    if (p.get('auth') === 'success') showToast('Signed in with Google!', 'success');
+    if (p.get('auth') === 'error')   showToast('Google sign-in failed', 'error');
     if (p.has('auth')) history.replaceState({}, '', '/');
   })();
 
@@ -1158,8 +1210,12 @@
       await loadStats();
 
       if (data.last_status === 'available') {
-        showAlertBanner(data.checkout_url || data.url, `${data.name} — Checkout is ready. Complete OTP manually.`);
-        showToast('🎫 TICKETS AVAILABLE!', 'success');
+        let checkUrl = data.checkout_url || data.url;
+        const m = checkUrl.match(/in\.bookmyshow\.com\/(?:sports|events)\/([^?#]+)/);
+        if (m) checkUrl = 'https://in.bookmyshow.com/buytickets/' + m[1].replace(/\/+$/, '');
+        if (data.cart_url) checkUrl = data.cart_url;
+        showAlertBanner(checkUrl, `${data.name} - Bot selecting seats... standby`, data.id);
+        showToast('TICKETS AVAILABLE!', 'success');
       } else if (!silent) {
         showToast('Status: ' + (data.last_status || 'unknown'));
       }
@@ -1180,22 +1236,43 @@
   }
   const _deviceId = _getDeviceId();
 
+  // ── Cart pay button handler ─────────────────────────────────────────────────
+  function handleCartPayClick(event) {
+    const btn = document.getElementById('cart-pay-btn');
+    const href = btn.href;
+    if (!href || href === '#' || href.endsWith('#')) {
+      event.preventDefault();
+      showToast('Cart URL not ready yet — wait a moment', 'error');
+      return false;
+    }
+    // Open in new tab
+    return true;
+  }
+
   // ── Alert banner ────────────────────────────────────────────────────────────
   let _sessionId   = null;   // the session_id claimed by THIS device
   let _otpPollTimer = null;
+  let _currentCartUrl = null;
 
   function showAlertBanner(url, msg, watcherId = null) {
-    document.getElementById('alert-title').textContent = '🟢 TICKETS AVAILABLE!';
+    document.getElementById('alert-title').textContent = 'TICKETS AVAILABLE!';
     document.getElementById('alert-body').textContent  = msg;
-    document.getElementById('alert-open-btn').onclick  = () => window.open(url, '_blank');
+    // "Open Page" should go to the buytickets/checkout URL
+    const openBtn = document.getElementById('alert-open-btn');
+    _currentCartUrl = url;
+    openBtn.onclick = () => {
+      const targetUrl = _currentCartUrl || url;
+      window.open(targetUrl, '_blank');
+    };
     document.getElementById('alert-banner').classList.add('show');
+    document.getElementById('cart-section').style.display = 'none';
     document.getElementById('otp-section').style.display = 'none';
     document.getElementById('otp-status').textContent = '';
     document.getElementById('otp-input').value = '';
     document.getElementById('otp-input').disabled = false;
 
     playAlarmSound();
-    setTimeout(() => closeAlert(), 30000);
+    setTimeout(() => closeAlert(), 60000);
 
     // Claim a slot (card) for this device and start polling
     if (watcherId) _claimAndPoll(watcherId);
@@ -1239,39 +1316,57 @@
         const data = await res.json();
         const card = data.card_priority ? `Card #${data.card_priority}` : 'Card';
 
+        // Update running status message
+        if (data.status === 'running' && data.message) {
+          document.getElementById('alert-body').textContent = data.message;
+        }
+
         if (data.status === 'cart_ready') {
           // Bot added to cart — show the pay button with the cart URL
-          const cartUrl = data.cart_url || '#';
+          const cartUrl = data.cart_url || '';
           document.getElementById('cart-section').style.display = 'block';
           document.getElementById('otp-section').style.display  = 'none';
-          document.getElementById('alert-title').textContent = '🛒 CART READY — PAY NOW!';
+          document.getElementById('alert-title').textContent = 'CART READY - PAY NOW!';
           document.getElementById('alert-body').textContent  =
-            `${card} seats selected &amp; added to cart:`;
-          document.getElementById('cart-pay-btn').href = cartUrl;
+            `${card}: seats selected and added to cart`;
+
+          if (cartUrl) {
+            document.getElementById('cart-pay-btn').href = cartUrl;
+            document.getElementById('cart-url-display').textContent = cartUrl;
+            // Update "Open Page" button to use cart URL too
+            _currentCartUrl = cartUrl;
+            document.getElementById('alert-open-btn').onclick = () => window.open(cartUrl, '_blank');
+          } else {
+            document.getElementById('cart-pay-btn').href = '#';
+            document.getElementById('cart-url-display').textContent = 'Waiting for URL...';
+          }
+
           playAlarmSound();
           clearInterval(_otpPollTimer);
-          showToast('🛒 Cart ready! Tap to pay.', 'success');
+          showToast('Cart ready! Tap to pay.', 'success');
         } else if (data.status === 'otp_required') {
           document.getElementById('cart-section').style.display = 'none';
           document.getElementById('otp-section').style.display  = 'block';
-          document.getElementById('alert-title').textContent = '🔐 OTP REQUIRED';
+          document.getElementById('alert-title').textContent = 'OTP REQUIRED';
           document.getElementById('alert-body').textContent  =
-            `✅ ${card} form filled — enter the OTP sent to your phone:`;
+            `${card} form filled - enter the OTP sent to your phone:`;
           clearInterval(_otpPollTimer);
         } else if (data.status === 'success') {
           document.getElementById('cart-section').style.display = 'none';
           document.getElementById('otp-section').style.display  = 'none';
-          document.getElementById('alert-title').textContent = '✅ BOOKED!';
+          document.getElementById('alert-title').textContent = 'BOOKED!';
           document.getElementById('alert-body').textContent  =
-            `🎉 ${card} booking confirmed! Check your email.`;
+            `${card} booking confirmed! Check your email.`;
           clearInterval(_otpPollTimer);
-          showToast('🎉 Booking confirmed!', 'success');
+          stopAlarmSound();
+          showToast('Booking confirmed!', 'success');
         } else if (data.status === 'failed') {
           document.getElementById('cart-section').style.display = 'none';
           document.getElementById('otp-section').style.display  = 'none';
           document.getElementById('alert-body').textContent  =
-            `⚠️ ${card} failed: ${data.message}`;
+            `${card} failed: ${data.message}`;
           clearInterval(_otpPollTimer);
+          stopAlarmSound();
         }
       } catch(e) { /* silent */ }
     }, 2000);
@@ -1363,10 +1458,16 @@
         // Fire alarm if status changed OR first time seeing this watcher as available
         if (prev !== 'available' && !_alarmActive) {
           _alarmActive = true;
-          const url = w.checkout_url || w.url;
-          showAlertBanner(url, `${w.name} — Auto-checkout started! Standby…`, w.id);
-          showToast('🎫 TICKETS AVAILABLE! Auto-booking…', 'success');
-          // Auto-stop alarm flag after 2 minutes so it can re-trigger
+          // Derive the buytickets URL for BookMyShow events
+          let openUrl = w.checkout_url || w.url;
+          const bmsMatch = openUrl.match(/in\.bookmyshow\.com\/(?:sports|events)\/([^?#]+)/);
+          if (bmsMatch) {
+            openUrl = 'https://in.bookmyshow.com/buytickets/' + bmsMatch[1].replace(/\/+$/, '');
+          }
+          // If cart_url is already set (from a previous session), use that
+          if (w.cart_url) openUrl = w.cart_url;
+          showAlertBanner(openUrl, `${w.name} - Bot selecting seats... standby`, w.id);
+          showToast('TICKETS AVAILABLE! Auto-booking...', 'success');
           setTimeout(() => { _alarmActive = false; }, 120000);
         }
       }
