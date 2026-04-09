@@ -10,6 +10,9 @@ worker_class = "sync"
 def post_fork(server, worker):
     try:
         from backend.app import start_monitor
+        from backend.autocheckout import start_checkout_workers
     except ImportError:
         from app import start_monitor
+        from autocheckout import start_checkout_workers
+    start_checkout_workers()
     start_monitor()

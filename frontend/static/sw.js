@@ -37,6 +37,7 @@ self.addEventListener("push", (event) => {
     data: {
       url: payload.url || "/",
       type: payload.type || "UNKNOWN",
+      watcherId: payload.watcher_id || null,
     },
     requireInteraction: payload.requireInteraction || isAlarm || isCartReady,
     silent: false,
@@ -65,21 +66,44 @@ self.addEventListener("notificationclick", (event) => {
 
   if (event.action === "dismiss") return;
 
-  const url  = event.notification.data?.url || "/";
+  const url = event.notification.data?.url || "/";
   const type = event.notification.data?.type || "";
+  const watcherId = event.notification.data?.watcherId || "";
 
   // For CART_READY and AVAILABLE — always open the target URL in a new tab
   // These are external BookMyShow/District URLs that need their own tab
   const isExternal = url.startsWith("http") && !url.includes(self.location.hostname);
-  const forceNewTab = type === "CART_READY" || type === "AVAILABLE" || isExternal;
+  const appUrl = watcherId
+    ? `/?alert=${encodeURIComponent(type.toLowerCase())}&watcher=${encodeURIComponent(watcherId)}&url=${encodeURIComponent(url)}`
+    : "/";
 
   event.waitUntil(
     clients.matchAll({ type: "window", includeUncontrolled: true }).then((clientList) => {
-      if (forceNewTab) {
-        // Notify any open TicketAlert tab so the banner shows there too
+      if (type === "AVAILABLE") {
         for (const client of clientList) {
           if (client.url.includes(self.location.hostname)) {
-            client.postMessage({ type: "TICKET_AVAILABLE", url, notificationType: type });
+            if ("focus" in client) client.focus();
+            client.postMessage({
+              type: "TICKET_AVAILABLE",
+              url,
+              watcherId,
+              notificationType: type,
+            });
+            return;
+          }
+        }
+        return clients.openWindow(appUrl);
+      }
+
+      if (type === "CART_READY" || isExternal) {
+        for (const client of clientList) {
+          if (client.url.includes(self.location.hostname)) {
+            client.postMessage({
+              type: "TICKET_AVAILABLE",
+              url,
+              watcherId,
+              notificationType: type,
+            });
           }
         }
         return clients.openWindow(url);
@@ -89,12 +113,12 @@ self.addEventListener("notificationclick", (event) => {
       for (const client of clientList) {
         if (client.url.includes(self.location.origin) && "focus" in client) {
           client.focus();
-          client.postMessage({ type: "TICKET_AVAILABLE", url });
+          client.postMessage({ type: "TICKET_AVAILABLE", url, watcherId, notificationType: type });
           return;
         }
       }
       if (clients.openWindow) {
-        return clients.openWindow(url);
+        return clients.openWindow(appUrl);
       }
     })
   );

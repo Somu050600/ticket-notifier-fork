@@ -472,6 +472,7 @@
 
     .alert-btn.primary { background: var(--green); color: #001a0d; }
     .alert-btn.secondary { background: transparent; color: var(--muted); border: 1px solid var(--border); }
+    .alert-btn:disabled { opacity: .55; cursor: not-allowed; }
 
     /* ── HOW IT WORKS ── */
     .how-section {
@@ -882,7 +883,13 @@
 
       navigator.serviceWorker.addEventListener('message', (event) => {
         if (event.data?.type === 'TICKET_AVAILABLE') {
-          showAlertBanner(event.data.url, 'Tickets are available!');
+          const isPendingCart = event.data.notificationType === 'AVAILABLE' && !isDirectBookingUrl(event.data.url);
+          showAlertBanner(
+            event.data.url,
+            isPendingCart ? 'Preparing your booking link...' : 'Tickets are available!',
+            event.data.watcherId || null,
+            { awaitCart: isPendingCart }
+          );
         }
       });
 
@@ -1019,6 +1026,22 @@
     }
   }
 
+  function resolveWatcherTargetUrl(w, { preferCart = true } = {}) {
+    if (preferCart && w.cart_url) return w.cart_url;
+
+    let targetUrl = w.checkout_url || w.url || '';
+    const bmsMatch = targetUrl.match(/in\.bookmyshow\.com\/(?:sports|events)\/([^?#]+)/);
+    if (bmsMatch) {
+      targetUrl = 'https://in.bookmyshow.com/buytickets/' + bmsMatch[1].replace(/\/+$/, '');
+    }
+    return targetUrl;
+  }
+
+  function isDirectBookingUrl(url) {
+    if (!url) return false;
+    return /(ticket-options|cart|checkout|payment|order|booking)/i.test(url);
+  }
+
   function renderWatchers() {
     const list  = document.getElementById('watchers-list');
     const empty = document.getElementById('empty-state');
@@ -1040,7 +1063,7 @@
   function cardHTML(w) {
     const status   = w.last_status || 'checking';
     const platform = w.platform || 'bookmyshow';
-    const targetUrl = w.checkout_url || w.url;
+    const targetUrl = resolveWatcherTargetUrl(w);
     const platformName = {
       bookmyshow: 'BookMyShow',
       district: 'District',
@@ -1210,11 +1233,10 @@
       await loadStats();
 
       if (data.last_status === 'available') {
-        let checkUrl = data.checkout_url || data.url;
-        const m = checkUrl.match(/in\.bookmyshow\.com\/(?:sports|events)\/([^?#]+)/);
-        if (m) checkUrl = 'https://in.bookmyshow.com/buytickets/' + m[1].replace(/\/+$/, '');
-        if (data.cart_url) checkUrl = data.cart_url;
-        showAlertBanner(checkUrl, `${data.name} - Bot selecting seats... standby`, data.id);
+        const checkUrl = resolveWatcherTargetUrl(data);
+        showAlertBanner(checkUrl, `${data.name} - Bot selecting seats... standby`, data.id, {
+          awaitCart: !data.cart_url && !isDirectBookingUrl(checkUrl),
+        });
         showToast('TICKETS AVAILABLE!', 'success');
       } else if (!silent) {
         showToast('Status: ' + (data.last_status || 'unknown'));
@@ -1250,20 +1272,34 @@
   }
 
   // ── Alert banner ────────────────────────────────────────────────────────────
-  let _sessionId   = null;   // the session_id claimed by THIS device
+  let _sessionId = null;   // the session_id claimed by THIS device
   let _otpPollTimer = null;
   let _currentCartUrl = null;
+  let _fallbackOpenUrl = null;
 
-  function showAlertBanner(url, msg, watcherId = null) {
-    document.getElementById('alert-title').textContent = 'TICKETS AVAILABLE!';
-    document.getElementById('alert-body').textContent  = msg;
-    // "Open Page" should go to the buytickets/checkout URL
+  function updateAlertOpenButton(url, { enabled = true, label = 'Open Page' } = {}) {
     const openBtn = document.getElementById('alert-open-btn');
-    _currentCartUrl = url;
+    openBtn.textContent = label;
+    openBtn.disabled = !enabled;
     openBtn.onclick = () => {
-      const targetUrl = _currentCartUrl || url;
+      const targetUrl = _currentCartUrl || _fallbackOpenUrl || url;
+      if (!targetUrl) {
+        showToast('Booking link is still being prepared', 'error');
+        return;
+      }
       window.open(targetUrl, '_blank');
     };
+  }
+
+  function showAlertBanner(url, msg, watcherId = null, { awaitCart = false } = {}) {
+    document.getElementById('alert-title').textContent = 'TICKETS AVAILABLE!';
+    document.getElementById('alert-body').textContent  = msg;
+    _fallbackOpenUrl = url || null;
+    _currentCartUrl = awaitCart ? null : url;
+    updateAlertOpenButton(awaitCart ? null : url, {
+      enabled: !awaitCart && !!(_currentCartUrl || _fallbackOpenUrl),
+      label: awaitCart ? 'Preparing Cart...' : 'Open Page',
+    });
     document.getElementById('alert-banner').classList.add('show');
     document.getElementById('cart-section').style.display = 'none';
     document.getElementById('otp-section').style.display = 'none';
@@ -1274,7 +1310,6 @@
     playAlarmSound();
     setTimeout(() => closeAlert(), 60000);
 
-    // Claim a slot (card) for this device and start polling
     if (watcherId) _claimAndPoll(watcherId);
   }
 
@@ -1282,6 +1317,9 @@
     document.getElementById('alert-banner').classList.remove('show');
     stopAlarmSound();
     if (_otpPollTimer) { clearInterval(_otpPollTimer); _otpPollTimer = null; }
+    _sessionId = null;
+    _currentCartUrl = null;
+    _fallbackOpenUrl = null;
   }
 
   // Claim the next free slot, then start polling that session
@@ -1298,6 +1336,7 @@
         const cardNum = data.card_priority;
         document.getElementById('alert-body').textContent =
           `🤖 Auto-checkout started with Card #${cardNum} — standby…`;
+        updateAlertOpenButton(null, { enabled: false, label: 'Preparing Cart...' });
         _startStatusPoll(_sessionId);
       } else {
         // No free slot — all cards claimed by other devices
@@ -1335,10 +1374,12 @@
             document.getElementById('cart-url-display').textContent = cartUrl;
             // Update "Open Page" button to use cart URL too
             _currentCartUrl = cartUrl;
-            document.getElementById('alert-open-btn').onclick = () => window.open(cartUrl, '_blank');
+            _fallbackOpenUrl = cartUrl;
+            updateAlertOpenButton(cartUrl, { enabled: true, label: 'Open Cart' });
           } else {
             document.getElementById('cart-pay-btn').href = '#';
             document.getElementById('cart-url-display').textContent = 'Waiting for URL...';
+            updateAlertOpenButton(null, { enabled: false, label: 'Preparing Cart...' });
           }
 
           playAlarmSound();
@@ -1350,6 +1391,10 @@
           document.getElementById('alert-title').textContent = 'OTP REQUIRED';
           document.getElementById('alert-body').textContent  =
             `${card} form filled - enter the OTP sent to your phone:`;
+          updateAlertOpenButton(_currentCartUrl || _fallbackOpenUrl, {
+            enabled: !!(_currentCartUrl || _fallbackOpenUrl),
+            label: 'Open Cart',
+          });
           clearInterval(_otpPollTimer);
         } else if (data.status === 'success') {
           document.getElementById('cart-section').style.display = 'none';
@@ -1458,15 +1503,10 @@
         // Fire alarm if status changed OR first time seeing this watcher as available
         if (prev !== 'available' && !_alarmActive) {
           _alarmActive = true;
-          // Derive the buytickets URL for BookMyShow events
-          let openUrl = w.checkout_url || w.url;
-          const bmsMatch = openUrl.match(/in\.bookmyshow\.com\/(?:sports|events)\/([^?#]+)/);
-          if (bmsMatch) {
-            openUrl = 'https://in.bookmyshow.com/buytickets/' + bmsMatch[1].replace(/\/+$/, '');
-          }
-          // If cart_url is already set (from a previous session), use that
-          if (w.cart_url) openUrl = w.cart_url;
-          showAlertBanner(openUrl, `${w.name} - Bot selecting seats... standby`, w.id);
+          const openUrl = resolveWatcherTargetUrl(w);
+          showAlertBanner(openUrl, `${w.name} - Bot selecting seats... standby`, w.id, {
+            awaitCart: !w.cart_url && !isDirectBookingUrl(openUrl),
+          });
           showToast('TICKETS AVAILABLE! Auto-booking...', 'success');
           setTimeout(() => { _alarmActive = false; }, 120000);
         }
@@ -1487,6 +1527,24 @@
   document.addEventListener('visibilitychange', () => {
     if (document.visibilityState === 'visible') poll();
   });
+
+  (function handlePendingAlertFromUrl() {
+    const params = new URLSearchParams(window.location.search);
+    const alertType = params.get('alert');
+    const watcherId = params.get('watcher');
+    const url = params.get('url') || '';
+
+    if (!alertType || !watcherId) return;
+
+    const awaitCart = alertType === 'available' && !isDirectBookingUrl(url);
+    showAlertBanner(
+      url,
+      awaitCart ? 'Preparing your booking link...' : 'Tickets are available!',
+      watcherId,
+      { awaitCart }
+    );
+    history.replaceState({}, '', '/');
+  })();
   </script>
 </body>
 </html>

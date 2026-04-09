@@ -8,6 +8,7 @@ py-vapid>=1.9
 gunicorn>=21.0
 python-dotenv>=1.0
 playwright>=1.44
+playwright-stealth>=2.0
 psycopg2-binary>=2.9
 twilio>=8.0
 itsdangerous>=2.1

@@ -24,6 +24,7 @@ Card pool (for full-checkout mode only):
 import asyncio
 import logging
 import os
+import queue
 import random
 import re
 import threading
@@ -72,6 +73,9 @@ def _profile() -> dict:
 # ── Session state ─────────────────────────────────────────────────────────────
 _sessions: dict[str, dict] = {}
 _sessions_lock = threading.Lock()
+_checkout_queue: "queue.Queue[tuple[str, str, dict, bool, str, str]]" = queue.Queue()
+_checkout_workers: list[threading.Thread] = []
+_checkout_worker_lock = threading.Lock()
 
 
 def _session_id(watcher_id: str, priority: int) -> str:
@@ -85,7 +89,7 @@ def claim_slot(watcher_id: str, device_id: str) -> Optional[str]:
         for priority in range(1, 4):
             sid = _session_id(watcher_id, priority)
             sess = _sessions.get(sid)
-            if sess and sess.get("status") in ("running", "otp_required") \
+            if sess and sess.get("status") in ("running", "otp_required", "cart_ready") \
                     and sess.get("device_id") is None:
                 sess["device_id"] = device_id
                 logger.info(f"[{sid}] Claimed by device {device_id}")
@@ -132,6 +136,53 @@ def _update(session_id: str, **kwargs):
     with _sessions_lock:
         if session_id in _sessions:
             _sessions[session_id].update(kwargs)
+
+
+def _is_actionable_cart_url(url: str) -> bool:
+    if not url:
+        return False
+    return any(part in url.lower() for part in ("ticket-options", "cart", "checkout", "payment", "order", "booking"))
+
+
+def _checkout_worker_loop():
+    while True:
+        job = _checkout_queue.get()
+        if job is None:
+            _checkout_queue.task_done()
+            break
+        try:
+            _run_in_thread(*job)
+        except Exception as e:
+            logger.exception(f"Checkout worker crashed: {e}")
+        finally:
+            _checkout_queue.task_done()
+
+
+def start_checkout_workers():
+    desired = max(1, int(os.environ.get("CHECKOUT_WORKERS", "1")))
+    with _checkout_worker_lock:
+        alive = [t for t in _checkout_workers if t.is_alive()]
+        _checkout_workers[:] = alive
+        while len(_checkout_workers) < desired:
+            idx = len(_checkout_workers) + 1
+            t = threading.Thread(
+                target=_checkout_worker_loop,
+                name=f"checkout-worker-{idx}",
+                daemon=True,
+            )
+            t.start()
+            _checkout_workers.append(t)
+    logger.info(
+        "Checkout worker pool ready (%s worker%s)",
+        len(_checkout_workers),
+        "" if len(_checkout_workers) == 1 else "s",
+    )
+
+
+def _enqueue_checkout(session_id: str, checkout_url: str, card: dict,
+                      cart_mode: bool, target_price: str, watcher_id: str):
+    start_checkout_workers()
+    _checkout_queue.put((session_id, checkout_url, card, cart_mode, target_price, watcher_id))
 
 
 # ── Stealth & Anti-detection ──────────────────────────────────────────────────
@@ -829,6 +880,11 @@ async def _run_checkout(session_id: str, checkout_url: str, card: dict,
         _update(session_id, status="failed", message="Playwright not installed")
         return
 
+    try:
+        from playwright_stealth import Stealth
+    except ImportError:
+        Stealth = None
+
     mode_label = "cart" if cart_mode else "checkout"
     _update(session_id, status="running", message=f"Starting {mode_label}...")
 
@@ -859,6 +915,11 @@ async def _run_checkout(session_id: str, checkout_url: str, card: dict,
             },
         )
         await ctx.add_init_script(STEALTH_JS)
+        if Stealth is not None:
+            try:
+                await Stealth(init_scripts_only=True).apply_stealth_async(ctx)
+            except Exception as e:
+                logger.warning(f"[{session_id}] playwright-stealth failed: {e}")
         page = await ctx.new_page()
 
         try:
@@ -888,6 +949,16 @@ async def _run_checkout(session_id: str, checkout_url: str, card: dict,
                 else:
                     # Generic fallback
                     cart_url = page.url
+
+                if not _is_actionable_cart_url(cart_url):
+                    logger.warning(f"[{session_id}] Could not capture actionable cart URL: {cart_url}")
+                    _update(
+                        session_id,
+                        status="failed",
+                        message="Could not capture cart URL after seat selection",
+                        cart_url=None,
+                    )
+                    return
 
                 _update(session_id,
                         status="cart_ready",
@@ -1112,7 +1183,7 @@ def trigger_auto_checkout(watcher_id: str, checkout_url: str,
 
     if cart_mode:
         sid = _session_id(watcher_id, 1)
-        cart_url = _derive_buytickets_url(checkout_url)
+        launch_url = _derive_buytickets_url(checkout_url)
 
         with _sessions_lock:
             existing = _sessions.get(sid, {}).get("status")
@@ -1121,18 +1192,19 @@ def trigger_auto_checkout(watcher_id: str, checkout_url: str,
                 return
             # Set session atomically (no gap between check and set)
             _sessions[sid] = {
-                "status":        "cart_ready",
-                "message":       "Booking link ready — open and select seats!",
+                "status":        "running",
+                "message":       "Starting cart automation...",
                 "otp":           None,
                 "device_id":     None,
                 "card_priority": 1,
-                "cart_url":      cart_url,
+                "cart_url":      None,
                 "cart_mode":     True,
                 "created_at":    time.time(),
             }
 
-        logger.info(f"[{sid}] CART MODE — sending buytickets URL: {cart_url}")
-        _notify_cart_ready(watcher_id, cart_url)
+        logger.info(f"[{sid}] CART MODE — launching browser flow: {launch_url}")
+        placeholder_card = {"priority": 1, "number": "", "expiry": "", "cvv": "", "name": ""}
+        _enqueue_checkout(sid, launch_url, placeholder_card, True, target_price, watcher_id)
         return
 
     # Full checkout mode
@@ -1161,8 +1233,4 @@ def trigger_auto_checkout(watcher_id: str, checkout_url: str,
 
         logger.info(f"[{sid}] Launching FULL CHECKOUT with card #{card['priority']}"
                     + (f" targeting Rs.{target_price}" if target_price else ""))
-        threading.Thread(
-            target=_run_in_thread,
-            args=(sid, checkout_url, card, False, target_price, watcher_id),
-            daemon=True,
-        ).start()
+        _enqueue_checkout(sid, checkout_url, card, False, target_price, watcher_id)

@@ -26,12 +26,14 @@ load_dotenv(ROOT_DIR / ".env")
 try:
     from .scraper import check_url_availability
     from .autocheckout import (trigger_auto_checkout, claim_slot,
-                                get_session, get_session_for_device, inject_otp)
+                                get_session, get_session_for_device, inject_otp,
+                                start_checkout_workers)
     from .auth import auth_bp, current_user, require_login, user_id
 except ImportError:
     from scraper import check_url_availability
     from autocheckout import (trigger_auto_checkout, claim_slot,
-                               get_session, get_session_for_device, inject_otp)
+                               get_session, get_session_for_device, inject_otp,
+                               start_checkout_workers)
     from auth import auth_bp, current_user, require_login, user_id
 
 logging.basicConfig(
@@ -265,7 +267,11 @@ def _derive_checkout_url(event_url: str) -> str:
 def notify_all(watcher, status):
     data = load_data()
     subs = data.get("subscriptions", [])
-    target_url = watcher.get("checkout_url") or _derive_checkout_url(watcher["url"])
+    target_url = (
+        watcher.get("cart_url")
+        or watcher.get("checkout_url")
+        or _derive_checkout_url(watcher["url"])
+    )
 
     if status == "available":
         payload = {
@@ -273,6 +279,7 @@ def notify_all(watcher, status):
             "title": "🎫 TICKETS AVAILABLE!",
             "body": f"{watcher['name']} — Open checkout now and complete OTP manually.",
             "url": target_url,
+            "watcher_id": watcher["id"],
             "alarm": True,
             "vibrate": [200, 100, 200, 100, 200, 100, 400],
             "requireInteraction": True,
@@ -292,6 +299,7 @@ def notify_all(watcher, status):
             "title": "⏰ Sale Opening Soon!",
             "body": f"{watcher['name']} — Ticket sale is about to begin!",
             "url": target_url,
+            "watcher_id": watcher["id"],
             "alarm": False,
             "tag": f"upcoming-{watcher['id']}",
         }
@@ -416,6 +424,7 @@ def monitor_loop():
 
 def start_monitor():
     global _monitor_thread
+    start_checkout_workers()
     if _monitor_thread and _monitor_thread.is_alive():
         return
     _stop_event.clear()
@@ -619,6 +628,7 @@ def _send_cart_notification(watcher, cart_url):
         "title":             "TICKETS LIVE - Book Now!",
         "body":              f"{watcher['name']} - Tap to open booking page and grab your seats!",
         "url":               cart_url,
+        "watcher_id":        watcher["id"],
         "alarm":             True,
         "requireInteraction": True,
         "vibrate":           [300, 100, 300, 100, 600],
