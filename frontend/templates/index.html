@@ -1207,10 +1207,31 @@
 
   async function removeWatcher(id) {
     if (!confirm('Remove this watcher?')) return;
-    await fetch(`/api/watchers/${id}`, { method: 'DELETE' });
-    await loadWatchers();
-    await loadStats();
-    showToast('Removed');
+    const card = document.getElementById(`card-${id}`);
+    if (card) {
+      card.style.opacity = '0.5';
+      card.style.pointerEvents = 'none';
+    }
+
+    try {
+      const res = await fetch(`/api/watchers/${id}`, { method: 'DELETE' });
+      let data = {};
+      try { data = await res.json(); } catch (e) {}
+      if (!res.ok) {
+        throw new Error(data.error || `Delete failed (${res.status})`);
+      }
+
+      watchers = watchers.filter(w => w.id !== id);
+      renderWatchers();
+      await loadStats();
+      showToast('Removed', 'success');
+    } catch (e) {
+      if (card) {
+        card.style.opacity = '1';
+        card.style.pointerEvents = '';
+      }
+      showToast(e.message || 'Could not remove watcher', 'error');
+    }
   }
 
   async function togglePause(id) {
