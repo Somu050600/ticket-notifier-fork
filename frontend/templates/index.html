@@ -1042,6 +1042,23 @@
     return /(ticket-options|cart|checkout|payment|order|booking)/i.test(url);
   }
 
+  function openExternalLink(url, { preferNewTab = true } = {}) {
+    if (!url) return;
+
+    const isMobile = window.matchMedia('(max-width: 768px)').matches
+      || /android|iphone|ipad|ipod/i.test(navigator.userAgent);
+
+    if (!preferNewTab || isMobile) {
+      window.location.href = url;
+      return;
+    }
+
+    const opened = window.open(url, '_blank', 'noopener');
+    if (!opened) {
+      window.location.href = url;
+    }
+  }
+
   function formatCheckedTime(value) {
     if (!value) return '';
 
@@ -1303,8 +1320,9 @@
       showToast('Cart URL not ready yet — wait a moment', 'error');
       return false;
     }
-    // Open in new tab
-    return true;
+    event.preventDefault();
+    openExternalLink(href, { preferNewTab: true });
+    return false;
   }
 
   // ── Alert banner ────────────────────────────────────────────────────────────
@@ -1323,7 +1341,7 @@
         showToast('Booking link is still being prepared', 'error');
         return;
       }
-      window.open(targetUrl, '_blank');
+      openExternalLink(targetUrl, { preferNewTab: true });
     };
   }
 

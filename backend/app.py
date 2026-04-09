@@ -27,13 +27,13 @@ try:
     from .scraper import check_url_availability
     from .autocheckout import (trigger_auto_checkout, claim_slot,
                                 get_session, get_session_for_device, inject_otp,
-                                start_checkout_workers)
+                                start_worker)
     from .auth import auth_bp, current_user, require_login, user_id
 except ImportError:
     from scraper import check_url_availability
     from autocheckout import (trigger_auto_checkout, claim_slot,
                                get_session, get_session_for_device, inject_otp,
-                               start_checkout_workers)
+                               start_worker)
     from auth import auth_bp, current_user, require_login, user_id
 
 logging.basicConfig(
@@ -314,19 +314,15 @@ def notify_all(watcher, status):
     else:
         return
 
-    # ── Auto-checkout / cart-add (triggered only when status is available) ──────
+    # ── Auto-checkout (non-blocking — enqueues to background worker) ─────────
     if status == "available":
         checkout_url = watcher.get("checkout_url") or _derive_checkout_url(watcher["url"])
-        threading.Thread(
-            target=trigger_auto_checkout,
-            args=(watcher["id"], checkout_url),
-            kwargs={
-                "cart_mode":    watcher.get("cart_mode", True),
-                "target_price": watcher.get("target_price", ""),
-                "owner_email":  watcher.get("owner", ""),
-            },
-            daemon=True,
-        ).start()
+        trigger_auto_checkout(
+            watcher["id"], checkout_url,
+            cart_mode=watcher.get("cart_mode", True),
+            target_price=watcher.get("target_price", ""),
+            owner_email=watcher.get("owner", ""),
+        )
 
     # ── Direct alerts (SMS + Email + Ring Call) ────────────────────────────────
     threading.Thread(target=send_sms_alert,   args=(sms_msg,),            daemon=True).start()
@@ -424,7 +420,7 @@ def monitor_loop():
 
 def start_monitor():
     global _monitor_thread
-    start_checkout_workers()
+    start_worker()
     if _monitor_thread and _monitor_thread.is_alive():
         return
     _stop_event.clear()
@@ -700,6 +696,7 @@ def submit_otp():
 
 
 if __name__ == "__main__":
+    start_worker()
     start_monitor()
     port = int(os.environ.get("PORT", 5000))
     app.run(host="0.0.0.0", port=port, debug=False)
