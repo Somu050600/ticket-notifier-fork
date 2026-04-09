@@ -367,7 +367,7 @@ def apply_check_result(watcher, result):
     watcher.update({
         "last_status": status,
         "last_checked_ts": time.time(),
-        "last_checked": datetime.now().strftime("%d %b %Y, %I:%M %p"),
+        "last_checked": datetime.now().isoformat(),
     })
     if result.get("price"):
         watcher["price"] = result["price"]

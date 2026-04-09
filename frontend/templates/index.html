@@ -1042,6 +1042,21 @@
     return /(ticket-options|cart|checkout|payment|order|booking)/i.test(url);
   }
 
+  function formatCheckedTime(value) {
+    if (!value) return '';
+
+    const parsed = new Date(value);
+    if (Number.isNaN(parsed.getTime())) return value;
+
+    return new Intl.DateTimeFormat(undefined, {
+      day: '2-digit',
+      month: 'short',
+      year: 'numeric',
+      hour: '2-digit',
+      minute: '2-digit',
+    }).format(parsed);
+  }
+
   function renderWatchers() {
     const list  = document.getElementById('watchers-list');
     const empty = document.getElementById('empty-state');
@@ -1092,7 +1107,7 @@
         <div class="watcher-url">${escHtml(targetUrl)}</div>
         <div class="watcher-meta">
           <span class="status-badge ${status}">${badgeTxt}</span>
-          ${w.last_checked ? `<span class="watcher-time">Checked ${escHtml(w.last_checked)}</span>` : ''}
+          ${w.last_checked ? `<span class="watcher-time">Checked ${escHtml(formatCheckedTime(w.last_checked))}</span>` : ''}
           ${w.price ? `<span class="watcher-price">${escHtml(w.price)}</span>` : ''}
           ${w.paused ? '<span class="status-badge unknown">PAUSED</span>' : ''}
         </div>
