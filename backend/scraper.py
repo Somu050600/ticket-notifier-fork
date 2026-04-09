@@ -87,13 +87,15 @@ def pick_ua_and_viewport():
 # ── Status keyword lists ──────────────────────────────────────────────────────
 SOLD_OUT_PHRASES  = ["sold out", "housefull", "no tickets available",
                      "currently unavailable", "not available", "tickets sold",
-                     "show is sold out", "all tickets sold"]
+                     "show is sold out", "all tickets sold", "event closed",
+                     "booking closed", "bookings closed", "sales closed",
+                     "sale closed", "event is closed", "currently not on sale"]
 UPCOMING_PHRASES  = ["coming soon", "notify me", "sale starts",
                      "goes on sale", "registration open", "sale opens",
                      "ticket sales open", "sale will begin"]
 AVAILABLE_PHRASES = ["book now", "buy now", "buy tickets", "get tickets",
                      "book tickets", "add to cart", "select seats",
-                     "choose seats", "proceed", "book", "purchase"]
+                     "choose seats"]
 
 
 def _parse_html(html: str, url: str) -> dict:
@@ -131,19 +133,24 @@ def _parse_html(html: str, url: str) -> dict:
     buttons = soup.find_all(["button", "a"])
     for btn in buttons:
         btn_text = btn.get_text(strip=True).lower()
+        classes = btn.get("class") or []
+        class_text = " ".join(classes).lower() if isinstance(classes, list) else str(classes).lower()
+        aria_disabled = str(btn.get("aria-disabled", "")).lower()
+        disabled = (
+            btn.get("disabled") is not None
+            or "disabled" in class_text
+            or "inactive" in class_text
+            or "closed" in class_text
+            or aria_disabled == "true"
+        )
+
+        if any(phrase in btn_text for phrase in SOLD_OUT_PHRASES):
+            return {"status": "sold_out", "name": name, "price": price}
+
         for phrase in AVAILABLE_PHRASES:
             if phrase in btn_text:
-                disabled = (
-                    btn.get("disabled") is not None
-                    or "disabled" in (btn.get("class") or [])
-                    or btn.get("aria-disabled") == "true"
-                )
                 if not disabled:
                     return {"status": "available", "name": name, "price": price}
-
-    for phrase in AVAILABLE_PHRASES:
-        if phrase in text:
-            return {"status": "available", "name": name, "price": price}
 
     return {"status": "unknown", "name": name, "price": price}
 
