@@ -351,12 +351,15 @@ async def _fetch_with_playwright(url: str) -> Optional[str]:
     try:
         from playwright_stealth import stealth_async
         _stealth_fn = stealth_async
-    except ImportError:
+    except Exception:
         try:
             from playwright_stealth import Stealth
             _s = Stealth()
-            _stealth_fn = _s.apply_stealth
-        except ImportError:
+            for attr in ("stealth_async", "stealth", "apply_stealth", "apply"):
+                if hasattr(_s, attr):
+                    _stealth_fn = getattr(_s, attr)
+                    break
+        except Exception:
             pass
 
     ua = random.choice(USER_AGENTS)

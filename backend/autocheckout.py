@@ -947,20 +947,26 @@ async def _run_checkout(session_id: str, checkout_url: str, card: dict,
         return
 
     # Import stealth patcher (graceful fallback)
-    # playwright-stealth v2 exports stealth_async(page); older versions may have Stealth class
+    # playwright-stealth API varies across versions — probe for the right entry point
     _stealth_fn = None
     try:
         from playwright_stealth import stealth_async
         _stealth_fn = stealth_async
         logger.info(f"[{session_id}] playwright-stealth loaded (stealth_async)")
-    except ImportError:
+    except Exception:
         try:
             from playwright_stealth import Stealth
             _s = Stealth()
-            _stealth_fn = _s.apply_stealth
-            logger.info(f"[{session_id}] playwright-stealth loaded (Stealth class)")
-        except ImportError:
-            logger.warning(f"[{session_id}] playwright-stealth not installed — using manual patches")
+            # Probe for whichever method this version exposes
+            for attr in ("stealth_async", "stealth", "apply_stealth", "apply"):
+                if hasattr(_s, attr):
+                    _stealth_fn = getattr(_s, attr)
+                    logger.info(f"[{session_id}] playwright-stealth loaded (Stealth.{attr})")
+                    break
+            if not _stealth_fn:
+                logger.warning(f"[{session_id}] Stealth class found but no usable method — manual patches")
+        except Exception:
+            logger.warning(f"[{session_id}] playwright-stealth not available — using manual patches")
 
     mode_label = "cart" if cart_mode else "full-checkout"
     _update(session_id, status="running", message=f"Starting {mode_label}...")
