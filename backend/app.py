@@ -240,6 +240,7 @@ def send_push(subscription_info, payload):
             vapid_private_key=VAPID_PRIVATE_KEY,
             vapid_claims=VAPID_CLAIMS,
         )
+        logger.info(f"Web push sent to endpoint: {subscription_info.get('endpoint', '')[:30]}...")
         return True
     except WebPushException as e:
         logger.error(f"Push failed: {e}")
@@ -344,10 +345,12 @@ def notify_all(watcher, status):
 
     # ── Web push (browser notifications) ─────────────────────────────────────
     stale = []
+    owner = watcher.get("owner", "")
     for sub in subs:
-        result = send_push(sub, payload)
-        if result == "expired":
-            stale.append(sub)
+        if not owner or sub.get("owner") == owner:
+            result = send_push(sub, payload)
+            if result == "expired":
+                stale.append(sub)
     if stale:
         data["subscriptions"] = [s for s in subs if s not in stale]
         save_data(data)
