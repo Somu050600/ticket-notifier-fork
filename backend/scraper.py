@@ -346,21 +346,13 @@ async def _fetch_with_playwright(url: str) -> Optional[str]:
         logger.warning("Playwright not installed — skipping browser check")
         return None
 
-    # Import stealth (graceful fallback — same pattern as autocheckout.py)
-    _stealth_fn = None
+    # Import stealth patcher (playwright-stealth v2.x)
+    _stealth_cls = None
     try:
-        from playwright_stealth import stealth_async
-        _stealth_fn = stealth_async
+        from playwright_stealth import Stealth
+        _stealth_cls = Stealth
     except Exception:
-        try:
-            from playwright_stealth import Stealth
-            _s = Stealth()
-            for attr in ("stealth_async", "stealth", "apply_stealth", "apply"):
-                if hasattr(_s, attr):
-                    _stealth_fn = getattr(_s, attr)
-                    break
-        except Exception:
-            pass
+        pass
 
     ua = random.choice(USER_AGENTS)
     vp = random.choice(VIEWPORTS)
@@ -393,8 +385,16 @@ async def _fetch_with_playwright(url: str) -> Optional[str]:
 
         context = await browser.new_context(**ctx_kwargs)
 
-        # Manual fallback JS patches (only when stealth library unavailable)
-        if not _stealth_fn:
+        # ── Apply stealth patches to context ─────────────────────────
+        stealth_applied = False
+        if _stealth_cls:
+            try:
+                await _stealth_cls().apply_stealth_async(context)
+                stealth_applied = True
+            except Exception:
+                pass
+
+        if not stealth_applied:
             await context.add_init_script("""
                 Object.defineProperty(navigator,'webdriver',{get:()=>undefined});
                 try{delete navigator.__proto__.webdriver}catch(e){}
@@ -412,13 +412,6 @@ async def _fetch_with_playwright(url: str) -> Optional[str]:
             """)
 
         page = await context.new_page()
-
-        # stealth_async applies per-page; must be called after new_page()
-        if _stealth_fn:
-            try:
-                await _stealth_fn(page)
-            except Exception:
-                pass
 
         try:
             # Small random delay before navigation

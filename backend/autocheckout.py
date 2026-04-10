@@ -946,27 +946,14 @@ async def _run_checkout(session_id: str, checkout_url: str, card: dict,
         _update(session_id, status="failed", message="Playwright not installed")
         return
 
-    # Import stealth patcher (graceful fallback)
-    # playwright-stealth API varies across versions — probe for the right entry point
-    _stealth_fn = None
+    # Import stealth patcher
+    _stealth_cls = None
     try:
-        from playwright_stealth import stealth_async
-        _stealth_fn = stealth_async
-        logger.info(f"[{session_id}] playwright-stealth loaded (stealth_async)")
-    except Exception:
-        try:
-            from playwright_stealth import Stealth
-            _s = Stealth()
-            # Probe for whichever method this version exposes
-            for attr in ("stealth_async", "stealth", "apply_stealth", "apply"):
-                if hasattr(_s, attr):
-                    _stealth_fn = getattr(_s, attr)
-                    logger.info(f"[{session_id}] playwright-stealth loaded (Stealth.{attr})")
-                    break
-            if not _stealth_fn:
-                logger.warning(f"[{session_id}] Stealth class found but no usable method — manual patches")
-        except Exception:
-            logger.warning(f"[{session_id}] playwright-stealth not available — using manual patches")
+        from playwright_stealth import Stealth
+        _stealth_cls = Stealth
+        logger.info(f"[{session_id}] playwright-stealth v2 loaded")
+    except Exception as e:
+        logger.warning(f"[{session_id}] playwright-stealth not available ({e}) — using manual JS patches")
 
     mode_label = "cart" if cart_mode else "full-checkout"
     _update(session_id, status="running", message=f"Starting {mode_label}...")
@@ -1005,8 +992,17 @@ async def _run_checkout(session_id: str, checkout_url: str, card: dict,
 
         ctx = await browser.new_context(**ctx_kwargs)
 
-        # ── Apply stealth (manual fallback if library not available) ────
-        if not _stealth_fn:
+        # ── Apply stealth patches to context ───────────────────────────
+        stealth_applied = False
+        if _stealth_cls:
+            try:
+                await _stealth_cls().apply_stealth_async(ctx)
+                stealth_applied = True
+                logger.info(f"[{session_id}] Stealth v2 patches applied to context")
+            except Exception as e:
+                logger.warning(f"[{session_id}] Stealth.apply_stealth_async failed ({e})")
+
+        if not stealth_applied:
             await ctx.add_init_script("""
                 Object.defineProperty(navigator,'webdriver',{get:()=>undefined});
                 try{delete navigator.__proto__.webdriver}catch(e){}
@@ -1032,16 +1028,9 @@ async def _run_checkout(session_id: str, checkout_url: str, card: dict,
                     if(p===37446)return'Intel Iris OpenGL Engine';
                     return _gp.call(this,p)};
             """)
+            logger.info(f"[{session_id}] Manual JS stealth patches applied")
 
         page = await ctx.new_page()
-
-        # stealth_async applies per-page; must be called after new_page()
-        if _stealth_fn:
-            try:
-                await _stealth_fn(page)
-                logger.info(f"[{session_id}] Stealth patches applied to page")
-            except Exception as e:
-                logger.warning(f"[{session_id}] stealth_fn failed ({e}), manual fallback active")
 
         try:
             # ── Navigate ─────────────────────────────────────────────────
