@@ -947,13 +947,20 @@ async def _run_checkout(session_id: str, checkout_url: str, card: dict,
         return
 
     # Import stealth patcher (graceful fallback)
-    stealth_patcher = None
+    # playwright-stealth v2 exports stealth_async(page); older versions may have Stealth class
+    _stealth_fn = None
     try:
-        from playwright_stealth import Stealth
-        stealth_patcher = Stealth()
-        logger.info(f"[{session_id}] playwright-stealth loaded")
+        from playwright_stealth import stealth_async
+        _stealth_fn = stealth_async
+        logger.info(f"[{session_id}] playwright-stealth loaded (stealth_async)")
     except ImportError:
-        logger.warning(f"[{session_id}] playwright-stealth not installed — using manual patches")
+        try:
+            from playwright_stealth import Stealth
+            _s = Stealth()
+            _stealth_fn = _s.apply_stealth
+            logger.info(f"[{session_id}] playwright-stealth loaded (Stealth class)")
+        except ImportError:
+            logger.warning(f"[{session_id}] playwright-stealth not installed — using manual patches")
 
     mode_label = "cart" if cart_mode else "full-checkout"
     _update(session_id, status="running", message=f"Starting {mode_label}...")
@@ -992,12 +999,8 @@ async def _run_checkout(session_id: str, checkout_url: str, card: dict,
 
         ctx = await browser.new_context(**ctx_kwargs)
 
-        # ── Apply stealth ────────────────────────────────────────────────
-        if stealth_patcher:
-            await stealth_patcher.apply_stealth(ctx)
-            logger.info(f"[{session_id}] Stealth patches applied")
-        else:
-            # Manual fallback
+        # ── Apply stealth (manual fallback if library not available) ────
+        if not _stealth_fn:
             await ctx.add_init_script("""
                 Object.defineProperty(navigator,'webdriver',{get:()=>undefined});
                 try{delete navigator.__proto__.webdriver}catch(e){}
@@ -1025,6 +1028,14 @@ async def _run_checkout(session_id: str, checkout_url: str, card: dict,
             """)
 
         page = await ctx.new_page()
+
+        # stealth_async applies per-page; must be called after new_page()
+        if _stealth_fn:
+            try:
+                await _stealth_fn(page)
+                logger.info(f"[{session_id}] Stealth patches applied to page")
+            except Exception as e:
+                logger.warning(f"[{session_id}] stealth_fn failed ({e}), manual fallback active")
 
         try:
             # ── Navigate ─────────────────────────────────────────────────

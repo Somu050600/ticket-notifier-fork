@@ -18,12 +18,9 @@ def post_fork(server, worker):
     """Called after gunicorn forks the worker process."""
     try:
         from backend.app import start_monitor
-        from backend.autocheckout import start_worker
     except ImportError:
         from app import start_monitor
-        from autocheckout import start_worker
 
-    # Start the booking worker thread FIRST (so it's ready when tickets go live)
-    start_worker()
-    # Then start the availability monitor loop
+    # start_monitor() calls start_worker() internally, so a single call does both
     start_monitor()
+

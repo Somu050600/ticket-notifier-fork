@@ -47,7 +47,16 @@ app = Flask(
     template_folder=str(ROOT_DIR / "frontend" / "templates"),
     static_folder=str(ROOT_DIR / "frontend" / "static"),
 )
-app.secret_key = os.environ.get("SECRET_KEY", os.urandom(32))
+app.secret_key = os.environ.get("SECRET_KEY", "ticketalert-default-secret-change-me-in-production")
+
+# ── Session cookie config (critical for mobile browsers) ─────────────────────
+app.config["SESSION_COOKIE_SAMESITE"] = "Lax"
+app.config["SESSION_COOKIE_HTTPONLY"]  = True
+app.config["PERMANENT_SESSION_LIFETIME"] = 86400 * 30   # 30 days
+# Set Secure=True only when running behind HTTPS (Railway always uses HTTPS)
+if os.environ.get("RAILWAY_ENVIRONMENT") or os.environ.get("BASE_URL", "").startswith("https"):
+    app.config["SESSION_COOKIE_SECURE"] = True
+
 CORS(app, supports_credentials=True)
 app.register_blueprint(auth_bp)
 
@@ -696,7 +705,6 @@ def submit_otp():
 
 
 if __name__ == "__main__":
-    start_worker()
-    start_monitor()
+    start_monitor()   # start_monitor() calls start_worker() internally
     port = int(os.environ.get("PORT", 5000))
     app.run(host="0.0.0.0", port=port, debug=False)

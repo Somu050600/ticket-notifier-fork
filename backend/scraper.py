@@ -346,13 +346,18 @@ async def _fetch_with_playwright(url: str) -> Optional[str]:
         logger.warning("Playwright not installed — skipping browser check")
         return None
 
-    # Import stealth (graceful fallback)
-    stealth_patcher = None
+    # Import stealth (graceful fallback — same pattern as autocheckout.py)
+    _stealth_fn = None
     try:
-        from playwright_stealth import Stealth
-        stealth_patcher = Stealth()
+        from playwright_stealth import stealth_async
+        _stealth_fn = stealth_async
     except ImportError:
-        pass
+        try:
+            from playwright_stealth import Stealth
+            _s = Stealth()
+            _stealth_fn = _s.apply_stealth
+        except ImportError:
+            pass
 
     ua = random.choice(USER_AGENTS)
     vp = random.choice(VIEWPORTS)
@@ -385,10 +390,8 @@ async def _fetch_with_playwright(url: str) -> Optional[str]:
 
         context = await browser.new_context(**ctx_kwargs)
 
-        # Apply stealth
-        if stealth_patcher:
-            await stealth_patcher.apply_stealth(context)
-        else:
+        # Manual fallback JS patches (only when stealth library unavailable)
+        if not _stealth_fn:
             await context.add_init_script("""
                 Object.defineProperty(navigator,'webdriver',{get:()=>undefined});
                 try{delete navigator.__proto__.webdriver}catch(e){}
@@ -406,6 +409,13 @@ async def _fetch_with_playwright(url: str) -> Optional[str]:
             """)
 
         page = await context.new_page()
+
+        # stealth_async applies per-page; must be called after new_page()
+        if _stealth_fn:
+            try:
+                await _stealth_fn(page)
+            except Exception:
+                pass
 
         try:
             # Small random delay before navigation

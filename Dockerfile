@@ -59,8 +59,10 @@ RUN playwright install --with-deps chromium
 COPY . .
 
 # ── 5. Health check ─────────────────────────────────────────────────────────
+# Use wget (already installed above) — avoids Python nested-quote escaping issues
+# and lets the shell expand ${PORT} correctly.
 HEALTHCHECK --interval=30s --timeout=10s --start-period=60s --retries=3 \
-    CMD python -c "import urllib.request; urllib.request.urlopen('http://127.0.0.1:${PORT:-8000}/health')" || exit 1
+    CMD wget --spider -q http://127.0.0.1:${PORT:-8000}/health || exit 1
 
 # ── 6. Start Gunicorn ───────────────────────────────────────────────────────
 # gunicorn_config.py starts both the monitor loop AND the booking worker thread
