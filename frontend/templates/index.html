@@ -1263,6 +1263,13 @@
     }
   }
 
+  document.addEventListener('click', (event) => {
+    const link = event.target.closest('.watcher-actions a.icon-btn[target="_blank"]');
+    if (!link) return;
+    event.preventDefault();
+    openExternalLink(link.href, { preferNewTab: true });
+  });
+
   function formatCheckedTime(value) {
     if (!value) return '';
 
@@ -1791,10 +1798,16 @@
     const alertType = params.get('alert');
     const watcherId = params.get('watcher');
     const url = params.get('url') || '';
+    const autoOpen = params.get('open') === '1';
 
     if (!alertType || !watcherId) return;
 
     const awaitCart = alertType === 'available' && !isDirectBookingUrl(url);
+    if (autoOpen && url && !awaitCart) {
+      history.replaceState({}, '', '/');
+      openExternalLink(url, { preferNewTab: false });
+      return;
+    }
     showAlertBanner(
       url,
       awaitCart ? 'Preparing your booking link...' : 'Tickets are available!',

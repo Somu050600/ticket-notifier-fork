@@ -76,6 +76,7 @@ self.addEventListener("notificationclick", (event) => {
   const appUrl = watcherId
     ? `/?alert=${encodeURIComponent(type.toLowerCase())}&watcher=${encodeURIComponent(watcherId)}&url=${encodeURIComponent(url)}`
     : "/";
+  const appOpenUrl = `${appUrl}${appUrl.includes("?") ? "&" : "?"}open=1`;
 
   event.waitUntil(
     clients.matchAll({ type: "window", includeUncontrolled: true }).then((clientList) => {
@@ -106,7 +107,7 @@ self.addEventListener("notificationclick", (event) => {
             });
           }
         }
-        return clients.openWindow(url);
+        return clients.openWindow(appOpenUrl);
       }
 
       // For internal URLs: focus existing TicketAlert tab if open
