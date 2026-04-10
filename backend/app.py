@@ -57,6 +57,9 @@ app.config["PERMANENT_SESSION_LIFETIME"] = 86400 * 30   # 30 days
 if os.environ.get("RAILWAY_ENVIRONMENT") or os.environ.get("BASE_URL", "").startswith("https"):
     app.config["SESSION_COOKIE_SECURE"] = True
 
+from werkzeug.middleware.proxy_fix import ProxyFix
+app.wsgi_app = ProxyFix(app.wsgi_app, x_for=1, x_proto=1, x_host=1, x_prefix=1)
+
 CORS(app, supports_credentials=True)
 app.register_blueprint(auth_bp)
 
