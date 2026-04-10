@@ -402,15 +402,12 @@ def _build_proxy_config() -> Optional[dict]:
         )
         return None
 
-    session_uuid = uuid.uuid4().hex[:12]
-    sticky_username = f"{PROXY_USERNAME}-session-{session_uuid}"
-
     proxy = {
         "server":   f"http://{PROXY_SERVER}",
-        "username": sticky_username,
+        "username": PROXY_USERNAME,
         "password": PROXY_PASSWORD,
     }
-    logger.info(f"Proxy: {PROXY_SERVER} sticky session {session_uuid}")
+    logger.info(f"Proxy config activated: {PROXY_SERVER}")
     return proxy
 
 

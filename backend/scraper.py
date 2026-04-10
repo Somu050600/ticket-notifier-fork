@@ -55,23 +55,20 @@ VIEWPORTS = [
 
 
 def _get_requests_proxy() -> Optional[dict]:
-    """Build requests-compatible proxy dict with sticky session."""
+    """Build requests-compatible proxy dict."""
     if not all([PROXY_SERVER, PROXY_USERNAME, PROXY_PASSWORD]):
         return None
-    session_id = uuid.uuid4().hex[:8]
-    sticky_user = f"{PROXY_USERNAME}-session-{session_id}"
-    proxy_url = f"http://{sticky_user}:{PROXY_PASSWORD}@{PROXY_SERVER}"
+    proxy_url = f"http://{PROXY_USERNAME}:{PROXY_PASSWORD}@{PROXY_SERVER}"
     return {"http": proxy_url, "https": proxy_url}
 
 
 def _get_playwright_proxy() -> Optional[dict]:
-    """Build Playwright-compatible proxy dict with sticky session."""
+    """Build Playwright-compatible proxy dict."""
     if not all([PROXY_SERVER, PROXY_USERNAME, PROXY_PASSWORD]):
         return None
-    session_id = uuid.uuid4().hex[:8]
     return {
         "server":   f"http://{PROXY_SERVER}",
-        "username": f"{PROXY_USERNAME}-session-{session_id}",
+        "username": PROXY_USERNAME,
         "password": PROXY_PASSWORD,
     }
 
