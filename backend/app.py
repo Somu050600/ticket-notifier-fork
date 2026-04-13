@@ -432,9 +432,9 @@ _monitor_thread = None
 _stop_event = threading.Event()
 _data_lock = threading.Lock()
 
-USE_BROWSER = os.environ.get("USE_BROWSER", "true").lower() == "true"
+USE_BROWSER = os.environ.get("USE_BROWSER", "false").lower() == "true"
 MIN_CHECK_INTERVAL_SECONDS = max(3, int(os.environ.get("MIN_CHECK_INTERVAL_SECONDS", "5")))
-MONITOR_LOOP_SECONDS = max(2, int(os.environ.get("MONITOR_LOOP_SECONDS", "2")))
+MONITOR_LOOP_SECONDS = max(1, int(os.environ.get("MONITOR_LOOP_SECONDS", "2")))
 
 
 def apply_check_result(watcher, result):

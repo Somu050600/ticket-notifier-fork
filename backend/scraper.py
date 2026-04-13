@@ -1,15 +1,21 @@
 """
-scraper.py — Availability checker with residential proxy & stealth.
+scraper.py — Fast availability checker with proxy circuit breaker.
 
-Strategy (in order of preference):
-  1. BookMyShow API — direct JSON endpoint, no browser needed, fastest
-  2. Playwright + stealth + residential proxy — for JS-heavy pages
-  3. Requests with proxy — lightweight fallback
+Strategy (optimised for SPEED):
+  1. BookMyShow API DIRECT (no proxy) — fastest, ~1-3s
+  2. BookMyShow API via proxy (if proxy healthy) — fallback
+  3. Requests DIRECT (no proxy) — lightweight HTML check ~2-4s
+  4. Requests via proxy — if direct is blocked
+  5. Playwright + stealth + proxy — ONLY when explicitly requested
 
 The BMS API approach is critical: instead of rendering the full page and
 parsing HTML for "Book Now" text, we hit BMS's own internal API that
 returns event data as JSON.  This is 10x faster and immune to HTML
 layout changes.
+
+PROXY CIRCUIT BREAKER: If the proxy fails consecutively, it is
+auto-disabled for a cooldown period to avoid wasting time on a
+dead proxy.
 """
 
 import asyncio
@@ -31,6 +37,44 @@ logger = logging.getLogger("ticketalert.scraper")
 PROXY_SERVER   = os.environ.get("PROXY_SERVER", "")
 PROXY_USERNAME = os.environ.get("PROXY_USERNAME", "")
 PROXY_PASSWORD = os.environ.get("PROXY_PASSWORD", "")
+
+# ── Proxy circuit breaker ────────────────────────────────────────────────────
+_proxy_failures = 0
+_proxy_disabled_until = 0.0
+_PROXY_MAX_FAILURES = 2           # disable proxy after 2 consecutive failures
+_PROXY_COOLDOWN_SECONDS = 300     # re-enable after 5 minutes
+
+
+def _proxy_is_healthy() -> bool:
+    """Check if proxy should be used (circuit breaker)."""
+    global _proxy_failures, _proxy_disabled_until
+    if _proxy_disabled_until > time.time():
+        return False
+    if _proxy_disabled_until > 0 and time.time() >= _proxy_disabled_until:
+        # Cooldown expired — reset and retry
+        _proxy_failures = 0
+        _proxy_disabled_until = 0.0
+    return True
+
+
+def _proxy_success():
+    """Record a successful proxy request."""
+    global _proxy_failures, _proxy_disabled_until
+    _proxy_failures = 0
+    _proxy_disabled_until = 0.0
+
+
+def _proxy_failure():
+    """Record a proxy failure and potentially trip the circuit breaker."""
+    global _proxy_failures, _proxy_disabled_until
+    _proxy_failures += 1
+    if _proxy_failures >= _PROXY_MAX_FAILURES:
+        _proxy_disabled_until = time.time() + _PROXY_COOLDOWN_SECONDS
+        logger.warning(
+            f"Proxy circuit breaker TRIPPED — disabled for "
+            f"{_PROXY_COOLDOWN_SECONDS}s after {_proxy_failures} consecutive failures"
+        )
+
 
 # ── User-Agent pool ──────────────────────────────────────────────────────────
 USER_AGENTS = [
@@ -55,16 +99,20 @@ VIEWPORTS = [
 
 
 def _get_requests_proxy() -> Optional[dict]:
-    """Build requests-compatible proxy dict."""
+    """Build requests-compatible proxy dict (only if circuit breaker allows)."""
     if not all([PROXY_SERVER, PROXY_USERNAME, PROXY_PASSWORD]):
+        return None
+    if not _proxy_is_healthy():
         return None
     proxy_url = f"http://{PROXY_USERNAME}:{PROXY_PASSWORD}@{PROXY_SERVER}"
     return {"http": proxy_url, "https": proxy_url}
 
 
 def _get_playwright_proxy() -> Optional[dict]:
-    """Build Playwright-compatible proxy dict."""
+    """Build Playwright-compatible proxy dict (only if circuit breaker allows)."""
     if not all([PROXY_SERVER, PROXY_USERNAME, PROXY_PASSWORD]):
+        return None
+    if not _proxy_is_healthy():
         return None
     return {
         "server":   f"http://{PROXY_SERVER}",
@@ -106,11 +154,15 @@ def _extract_bms_event_code(url: str) -> Optional[str]:
     return m.group(1) if m else None
 
 
-def _check_bms_api(url: str) -> Optional[dict]:
+def _check_bms_api(url: str, use_proxy: bool = False) -> Optional[dict]:
     """
     Hit BookMyShow's internal event data API directly.
     This returns JSON with event status, pricing, and availability
     without needing to render the full page.
+
+    Args:
+        url: The event URL containing the ET code.
+        use_proxy: If True, route through residential proxy.
 
     Returns a parsed result dict or None if the API call fails.
     """
@@ -136,7 +188,9 @@ def _check_bms_api(url: str) -> Optional[dict]:
         "DNT": "1",
     }
 
-    proxy = _get_requests_proxy()
+    proxy = _get_requests_proxy() if use_proxy else None
+    # Tight timeout for speed — API should respond in <3s
+    timeout = 5 if use_proxy else 4
 
     for api_url in api_urls:
         try:
@@ -144,13 +198,17 @@ def _check_bms_api(url: str) -> Optional[dict]:
                 api_url,
                 headers=headers,
                 proxies=proxy,
-                timeout=12,
+                timeout=timeout,
                 allow_redirects=True,
             )
 
             if resp.status_code != 200:
                 logger.debug(f"BMS API {resp.status_code}: {api_url[:80]}")
                 continue
+
+            # If we got here with proxy, record success
+            if use_proxy and proxy:
+                _proxy_success()
 
             data = resp.json()
 
@@ -219,6 +277,11 @@ def _check_bms_api(url: str) -> Optional[dict]:
             logger.info(f"BMS API: {event_code} → unknown (no clear signals)")
             return None  # inconclusive — let other methods try
 
+        except requests.exceptions.ProxyError as e:
+            logger.warning(f"BMS API proxy error: {e}")
+            if use_proxy:
+                _proxy_failure()
+            return None  # fail fast on proxy errors
         except (requests.RequestException, json.JSONDecodeError, ValueError) as e:
             logger.debug(f"BMS API failed for {api_url[:60]}: {e}")
             continue
@@ -227,7 +290,7 @@ def _check_bms_api(url: str) -> Optional[dict]:
 
 
 # ═════════════════════════════════════════════════════════════════════════════
-# §2  REQUESTS-BASED HTML CHECKER (with proxy)
+# §2  REQUESTS-BASED HTML CHECKER
 # ═════════════════════════════════════════════════════════════════════════════
 
 def _parse_html(html: str, url: str) -> dict:
@@ -304,8 +367,8 @@ def _parse_html(html: str, url: str) -> dict:
     return {"status": "unknown", "name": name, "price": price}
 
 
-def _fetch_with_requests(url: str) -> Optional[str]:
-    """Fetch page HTML via requests with residential proxy."""
+def _fetch_with_requests(url: str, use_proxy: bool = False) -> Optional[str]:
+    """Fetch page HTML via requests, optionally through proxy."""
     ua = random.choice(USER_AGENTS)
     headers = {
         "User-Agent": ua,
@@ -315,14 +378,22 @@ def _fetch_with_requests(url: str) -> Optional[str]:
         "Connection": "keep-alive",
         "Referer": "https://www.google.com/",
     }
-    proxy = _get_requests_proxy()
+    proxy = _get_requests_proxy() if use_proxy else None
+    timeout = 8 if use_proxy else 6
     try:
         resp = requests.get(
-            url, headers=headers, timeout=15,
+            url, headers=headers, timeout=timeout,
             allow_redirects=True, proxies=proxy,
         )
         resp.raise_for_status()
+        if use_proxy and proxy:
+            _proxy_success()
         return resp.text
+    except requests.exceptions.ProxyError as e:
+        logger.warning(f"Requests proxy error for {url[:60]}: {e}")
+        if use_proxy:
+            _proxy_failure()
+        return None
     except Exception as e:
         logger.warning(f"Requests fetch failed for {url[:80]}: {e}")
         return None
@@ -433,6 +504,8 @@ async def _fetch_with_playwright(url: str) -> Optional[str]:
 
             await asyncio.sleep(random.uniform(0.3, 0.8))
             html = await page.content()
+            if proxy:
+                _proxy_success()
             return html
 
         except PWTimeout:
@@ -440,6 +513,8 @@ async def _fetch_with_playwright(url: str) -> Optional[str]:
             return None
         except Exception as e:
             logger.warning(f"Playwright error on {url[:80]}: {e}")
+            if proxy:
+                _proxy_failure()
             return None
         finally:
             await context.close()
@@ -454,68 +529,105 @@ def check_url_availability(url: str, use_browser: bool = True) -> dict:
     """
     Check ticket availability for a URL.
 
-    Strategy:
-      1. BMS API (instant, no browser) — if URL is BookMyShow
-      2. Playwright + stealth + proxy — for JS-rendered pages
-      3. Requests + proxy — lightweight fallback
+    SPEED-OPTIMISED strategy (tries fastest methods first):
+      1. BMS API DIRECT (no proxy) — ~1-3s
+      2. BMS API via proxy (if healthy) — ~2-5s
+      3. Requests DIRECT (no proxy) — ~2-4s HTML check
+      4. Requests via proxy — ~3-8s HTML check
+      5. Playwright (only if use_browser=True and above all fail)
 
-    Retries up to 2 times with exponential back-off.
+    No retries for API checks (they either work or don't).
+    Single retry for HTML checks with short backoff.
     """
     is_bms = "bookmyshow.com" in url.lower()
+    start_time = time.time()
 
-    # ── Strategy 1: BMS API (fastest, most reliable) ─────────────────────
+    # ── Strategy 1: BMS API DIRECT (fastest — no proxy overhead) ─────────
     if is_bms:
         try:
-            result = _check_bms_api(url)
+            result = _check_bms_api(url, use_proxy=False)
             if result and result["status"] != "unknown":
-                logger.info(f"BMS API check: {result['status']} for {url[:60]}")
+                elapsed = time.time() - start_time
+                logger.info(
+                    f"BMS API (direct): {result['status']} for {url[:60]} "
+                    f"in {elapsed:.1f}s"
+                )
                 return result
         except Exception as e:
-            logger.debug(f"BMS API check failed: {e}")
+            logger.debug(f"BMS API (direct) failed: {e}")
 
-    # ── Strategy 2 & 3: Browser / Requests with retries ──────────────────
-    max_retries = 2
-    backoff = 3.0
-
-    for attempt in range(max_retries + 1):
+    # ── Strategy 2: BMS API via proxy (if proxy is healthy) ──────────────
+    if is_bms and _proxy_is_healthy():
         try:
-            html = None
-
-            # Try Playwright with stealth + proxy
-            if use_browser:
-                try:
-                    html = asyncio.run(_fetch_with_playwright(url))
-                except RuntimeError:
-                    loop = asyncio.new_event_loop()
-                    asyncio.set_event_loop(loop)
-                    html = loop.run_until_complete(_fetch_with_playwright(url))
-                    loop.close()
-
-            # Fallback to requests with proxy
-            if html is None:
-                html = _fetch_with_requests(url)
-
-            if html is None:
-                raise ValueError("All fetch methods returned no content")
-
-            result = _parse_html(html, url)
-
-            # Log what we found for debugging
-            logger.info(
-                f"Scraper: {result['status']} for {url[:60]} "
-                f"(name={result.get('name', '')[:40]})"
-            )
-            return result
-
+            result = _check_bms_api(url, use_proxy=True)
+            if result and result["status"] != "unknown":
+                elapsed = time.time() - start_time
+                logger.info(
+                    f"BMS API (proxy): {result['status']} for {url[:60]} "
+                    f"in {elapsed:.1f}s"
+                )
+                return result
         except Exception as e:
-            logger.warning(f"Attempt {attempt + 1} failed for {url[:60]}: {e}")
-            if attempt < max_retries:
-                sleep_time = backoff * (2 ** attempt) + random.uniform(0, 2)
-                logger.info(f"Retrying in {sleep_time:.1f}s")
-                time.sleep(sleep_time)
-            else:
-                logger.error(f"All {max_retries + 1} attempts failed for {url[:60]}")
-                return {
-                    "status": "error", "name": "", "price": "",
-                    "error": str(e),
-                }
+            logger.debug(f"BMS API (proxy) failed: {e}")
+
+    # ── Strategy 3: Direct HTML fetch (no proxy) ─────────────────────────
+    try:
+        html = _fetch_with_requests(url, use_proxy=False)
+        if html:
+            result = _parse_html(html, url)
+            if result["status"] != "unknown":
+                elapsed = time.time() - start_time
+                logger.info(
+                    f"Scraper (direct): {result['status']} for {url[:60]} "
+                    f"in {elapsed:.1f}s"
+                )
+                return result
+            # Got HTML but status unknown — still useful, save it
+            logger.info(f"Scraper (direct): unknown status for {url[:60]}")
+    except Exception as e:
+        logger.debug(f"Direct requests failed: {e}")
+
+    # ── Strategy 4: HTML fetch via proxy (if healthy) ────────────────────
+    if _proxy_is_healthy():
+        try:
+            html = _fetch_with_requests(url, use_proxy=True)
+            if html:
+                result = _parse_html(html, url)
+                elapsed = time.time() - start_time
+                logger.info(
+                    f"Scraper (proxy): {result['status']} for {url[:60]} "
+                    f"in {elapsed:.1f}s"
+                )
+                return result
+        except Exception as e:
+            logger.debug(f"Proxy requests failed: {e}")
+
+    # ── Strategy 5: Playwright (heavy, slow — last resort) ───────────────
+    if use_browser:
+        try:
+            try:
+                html = asyncio.run(_fetch_with_playwright(url))
+            except RuntimeError:
+                loop = asyncio.new_event_loop()
+                asyncio.set_event_loop(loop)
+                html = loop.run_until_complete(_fetch_with_playwright(url))
+                loop.close()
+
+            if html:
+                result = _parse_html(html, url)
+                elapsed = time.time() - start_time
+                logger.info(
+                    f"Scraper (playwright): {result['status']} for {url[:60]} "
+                    f"in {elapsed:.1f}s"
+                )
+                return result
+        except Exception as e:
+            logger.warning(f"Playwright failed: {e}")
+
+    # ── All methods exhausted ────────────────────────────────────────────
+    elapsed = time.time() - start_time
+    logger.error(f"All methods failed for {url[:60]} in {elapsed:.1f}s")
+    return {
+        "status": "error", "name": "", "price": "",
+        "error": "All fetch methods failed",
+    }
