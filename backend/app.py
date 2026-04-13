@@ -3,8 +3,10 @@ TicketAlert — Public Availability Notifier
 Flask backend with Web Push notifications for BookMyShow & District
 """
 
+import collections
 import json
 import os
+import re
 import smtplib
 import threading
 import time
@@ -47,7 +49,12 @@ app = Flask(
     template_folder=str(ROOT_DIR / "frontend" / "templates"),
     static_folder=str(ROOT_DIR / "frontend" / "static"),
 )
-app.secret_key = os.environ.get("SECRET_KEY", "ticketalert-default-secret-change-me-in-production")
+_secret = os.environ.get("SECRET_KEY", "")
+if not _secret:
+    import secrets
+    _secret = secrets.token_hex(32)
+    logger.warning("SECRET_KEY not set — generated ephemeral key (sessions won't survive restarts)")
+app.secret_key = _secret
 
 # ── Session cookie config (critical for mobile browsers) ─────────────────────
 app.config["SESSION_COOKIE_SAMESITE"] = "Lax"
@@ -60,8 +67,39 @@ if os.environ.get("RAILWAY_ENVIRONMENT") or os.environ.get("BASE_URL", "").start
 from werkzeug.middleware.proxy_fix import ProxyFix
 app.wsgi_app = ProxyFix(app.wsgi_app, x_for=1, x_proto=1, x_host=1, x_prefix=1)
 
-CORS(app, supports_credentials=True)
+# ── CORS — restrict origins in production ────────────────────────────────────
+_base_url = os.environ.get("BASE_URL", "").rstrip("/")
+_cors_origins = [_base_url] if _base_url else ["*"]
+CORS(app, supports_credentials=True, origins=_cors_origins)
 app.register_blueprint(auth_bp)
+
+# ── Simple in-memory rate limiter ────────────────────────────────────────────
+_rate_buckets: dict[str, collections.deque] = {}
+_rate_lock = threading.Lock()
+
+def _check_rate_limit(key: str, max_requests: int = 30, window_seconds: int = 60) -> bool:
+    """Returns True if rate limit exceeded."""
+    now = time.time()
+    with _rate_lock:
+        bucket = _rate_buckets.setdefault(key, collections.deque())
+        # Purge old entries
+        while bucket and bucket[0] < now - window_seconds:
+            bucket.popleft()
+        if len(bucket) >= max_requests:
+            return True
+        bucket.append(now)
+    return False
+
+@app.before_request
+def _rate_limit_check():
+    """Apply rate limiting to API endpoints."""
+    if request.path.startswith("/api/"):
+        # Rate limit by IP + user session
+        ip = request.remote_addr or "unknown"
+        uid = user_id() or ip
+        key = f"{uid}:{request.path}"
+        if _check_rate_limit(key, max_requests=60, window_seconds=60):
+            return jsonify({"error": "Too many requests — slow down"}), 429
 
 VAPID_PRIVATE_KEY = os.environ.get("VAPID_PRIVATE_KEY", "")
 VAPID_PUBLIC_KEY  = os.environ.get("VAPID_PUBLIC_KEY", "")
@@ -112,7 +150,8 @@ def send_ring_call(event_name: str, cart_url: str = ""):
         client = Client(TWILIO_SID, TWILIO_TOKEN)
 
         # TwiML spoken when the user picks up
-        safe_name = event_name.replace("&", "and").replace("<", "").replace(">", "")
+        # Strip all XML-unsafe chars and limit length to prevent TwiML injection
+        safe_name = re.sub(r'[<>&"\']', '', event_name)[:120]
         twiml = f"""
         <Response>
             <Say voice="alice" language="en-IN" loop="2">
@@ -184,39 +223,64 @@ if DATABASE_URL:
         logger.info("PostgreSQL tables ready")
 
     def load_data():
-        with _get_conn() as conn:
-            with conn.cursor() as cur:
-                cur.execute("SELECT data FROM watchers ORDER BY data->>'added_at'")
-                watchers = [r["data"] for r in cur.fetchall()]
-                cur.execute("SELECT data FROM subscriptions")
-                subs = [r["data"] for r in cur.fetchall()]
-        return {"watchers": watchers, "subscriptions": subs}
+        try:
+            with _get_conn() as conn:
+                with conn.cursor() as cur:
+                    cur.execute("SELECT data FROM watchers ORDER BY data->>'added_at'")
+                    watchers = [r["data"] for r in cur.fetchall()]
+                    cur.execute("SELECT data FROM subscriptions")
+                    subs = [r["data"] for r in cur.fetchall()]
+            return {"watchers": watchers, "subscriptions": subs}
+        except Exception as e:
+            logger.error(f"load_data failed: {e}")
+            return {"watchers": [], "subscriptions": []}
 
     def save_data(data):
-        with _get_conn() as conn:
-            with conn.cursor() as cur:
-                for w in data["watchers"]:
-                    cur.execute(
-                        "INSERT INTO watchers(id,data) VALUES(%s,%s) "
-                        "ON CONFLICT(id) DO UPDATE SET data=EXCLUDED.data",
-                        (w["id"], json.dumps(w))
-                    )
-                cur.execute("DELETE FROM subscriptions")
-                for s in data["subscriptions"]:
-                    cur.execute(
-                        "INSERT INTO subscriptions(endpoint,data) VALUES(%s,%s) ON CONFLICT DO NOTHING",
-                        (s.get("endpoint",""), json.dumps(s))
-                    )
-            conn.commit()
+        try:
+            with _get_conn() as conn:
+                with conn.cursor() as cur:
+                    for w in data["watchers"]:
+                        cur.execute(
+                            "INSERT INTO watchers(id,data) VALUES(%s,%s) "
+                            "ON CONFLICT(id) DO UPDATE SET data=EXCLUDED.data",
+                            (w["id"], json.dumps(w))
+                        )
+                    # Upsert subscriptions instead of delete-all + reinsert
+                    # to avoid losing data during concurrent requests
+                    for s in data["subscriptions"]:
+                        endpoint = s.get("endpoint", "")
+                        if endpoint:
+                            cur.execute(
+                                "INSERT INTO subscriptions(endpoint,data) VALUES(%s,%s) "
+                                "ON CONFLICT(endpoint) DO UPDATE SET data=EXCLUDED.data",
+                                (endpoint, json.dumps(s))
+                            )
+                conn.commit()
+        except Exception as e:
+            logger.error(f"save_data failed: {e}")
+            raise
 
     def delete_watcher_db(watcher_id):
-        with _get_conn() as conn:
-            with conn.cursor() as cur:
-                cur.execute("DELETE FROM watchers WHERE id=%s", (watcher_id,))
-            conn.commit()
+        try:
+            with _get_conn() as conn:
+                with conn.cursor() as cur:
+                    cur.execute("DELETE FROM watchers WHERE id=%s", (watcher_id,))
+                conn.commit()
+        except Exception as e:
+            logger.error(f"delete_watcher_db failed: {e}")
 
-    _init_db()
-    logger.info("Using PostgreSQL for storage")
+    # Retry DB init up to 3 times (Railway PG can take a moment to become ready)
+    for _attempt in range(3):
+        try:
+            _init_db()
+            logger.info("Using PostgreSQL for storage")
+            break
+        except Exception as e:
+            logger.warning(f"DB init attempt {_attempt + 1} failed: {e}")
+            if _attempt == 2:
+                logger.error("Could not connect to PostgreSQL after 3 attempts")
+                raise
+            time.sleep(2)
 
 else:
     DATA_FILE = ROOT_DIR / "data.json"
@@ -262,7 +326,6 @@ def _derive_checkout_url(event_url: str) -> str:
     This is the seat selection entry point (qty popup → stadium map).
     Falls back to the original URL if not a recognizable pattern.
     """
-    import re
     # BookMyShow: .../sports/slug/ETXXXXXX or .../events/slug/ETXXXXXX
     m = re.search(r'in\.bookmyshow\.com/(?:sports|events)/([^?#]+)', event_url)
     if m:
@@ -278,8 +341,9 @@ def _derive_checkout_url(event_url: str) -> str:
 
 
 def notify_all(watcher, status):
-    data = load_data()
-    subs = data.get("subscriptions", [])
+    with _data_lock:
+        data = load_data()
+    subs = list(data.get("subscriptions", []))  # defensive copy
     target_url = (
         watcher.get("cart_url")
         or watcher.get("checkout_url")
@@ -347,16 +411,21 @@ def notify_all(watcher, status):
                          daemon=True).start()
 
     # ── Web push (browser notifications) ─────────────────────────────────────
-    stale = []
+    stale_endpoints = []
     owner = watcher.get("owner", "")
     for sub in subs:
         if not owner or sub.get("owner") == owner:
             result = send_push(sub, payload)
             if result == "expired":
-                stale.append(sub)
-    if stale:
-        data["subscriptions"] = [s for s in subs if s not in stale]
-        save_data(data)
+                stale_endpoints.append(sub.get("endpoint"))
+    if stale_endpoints:
+        with _data_lock:
+            fresh_data = load_data()
+            fresh_data["subscriptions"] = [
+                s for s in fresh_data["subscriptions"]
+                if s.get("endpoint") not in stale_endpoints
+            ]
+            save_data(fresh_data)
 
 
 _monitor_thread = None
@@ -543,10 +612,29 @@ def add_watcher():
 
     return jsonify(watcher), 201
 
+def _validate_watcher_id(watcher_id: str) -> bool:
+    """Sanity-check watcher_id format to prevent injection."""
+    return bool(re.match(r'^[a-f0-9\-]{4,40}$', watcher_id))
+
+def _owns_watcher(watcher: dict) -> bool:
+    """Check that the current user owns a watcher (or it's legacy unowned)."""
+    uid = user_id()
+    owner = watcher.get("owner", "")
+    if uid and owner and uid != owner:
+        return False
+    return True
+
 @app.route("/api/watchers/<watcher_id>", methods=["DELETE"])
 def delete_watcher(watcher_id):
+    if not _validate_watcher_id(watcher_id):
+        return jsonify({"error": "Invalid watcher ID"}), 400
     with _data_lock:
         data = load_data()
+        watcher = next((w for w in data["watchers"] if w["id"] == watcher_id), None)
+        if not watcher:
+            return jsonify({"error": "Not found"}), 404
+        if not _owns_watcher(watcher):
+            return jsonify({"error": "Not authorized"}), 403
         data["watchers"] = [w for w in data["watchers"] if w["id"] != watcher_id]
         if DATABASE_URL:
             delete_watcher_db(watcher_id)
@@ -556,10 +644,14 @@ def delete_watcher(watcher_id):
 
 @app.route("/api/watchers/<watcher_id>/pause", methods=["POST"])
 def toggle_pause(watcher_id):
+    if not _validate_watcher_id(watcher_id):
+        return jsonify({"error": "Invalid watcher ID"}), 400
     with _data_lock:
         data = load_data()
         for w in data["watchers"]:
             if w["id"] == watcher_id:
+                if not _owns_watcher(w):
+                    return jsonify({"error": "Not authorized"}), 403
                 w["paused"] = not w.get("paused", False)
                 save_data(data)
                 return jsonify({"paused": w["paused"]})
@@ -567,11 +659,15 @@ def toggle_pause(watcher_id):
 
 @app.route("/api/watchers/<watcher_id>/check-now", methods=["POST"])
 def check_now(watcher_id):
+    if not _validate_watcher_id(watcher_id):
+        return jsonify({"error": "Invalid watcher ID"}), 400
     with _data_lock:
         data = load_data()
         watcher = next((w for w in data["watchers"] if w["id"] == watcher_id), None)
         if not watcher:
             return jsonify({"error": "Not found"}), 404
+        if not _owns_watcher(watcher):
+            return jsonify({"error": "Not authorized"}), 403
         url = watcher["url"]
 
     result = check_url_availability(url, use_browser=USE_BROWSER)
@@ -663,7 +759,35 @@ def _send_cart_notification(watcher, cart_url):
 
 @app.route("/health")
 def health():
-    return jsonify({"status": "ok", "ts": datetime.now().isoformat()})
+    db_ok = True
+    if DATABASE_URL:
+        try:
+            with _get_conn() as conn:
+                with conn.cursor() as cur:
+                    cur.execute("SELECT 1")
+        except Exception:
+            db_ok = False
+    monitor_ok = _monitor_thread is not None and _monitor_thread.is_alive()
+    status = "ok" if (db_ok and monitor_ok) else "degraded"
+    return jsonify({
+        "status": status,
+        "ts": datetime.now().isoformat(),
+        "database": "connected" if db_ok else "error",
+        "monitor": "running" if monitor_ok else "stopped",
+    }), 200 if status == "ok" else 503
+
+@app.errorhandler(404)
+def not_found(e):
+    if request.path.startswith("/api/"):
+        return jsonify({"error": "Not found"}), 404
+    return render_template("index.html", vapid_public_key=VAPID_PUBLIC_KEY), 404
+
+@app.errorhandler(500)
+def internal_error(e):
+    logger.error(f"Internal error: {e}")
+    if request.path.startswith("/api/"):
+        return jsonify({"error": "Internal server error"}), 500
+    return render_template("index.html", vapid_public_key=VAPID_PUBLIC_KEY), 500
 
 @app.route("/sw.js")
 def service_worker():

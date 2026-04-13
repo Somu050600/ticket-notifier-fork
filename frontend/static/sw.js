@@ -1,17 +1,27 @@
 // TicketAlert Service Worker
 // Handles Web Push notifications with alarm behaviour
 
-const CACHE_NAME = "ticketalert-v2";
+const CACHE_NAME = "ticketalert-v3";
+const PRECACHE_URLS = ["/"];
 
 self.addEventListener("install", (event) => {
   self.skipWaiting();
   event.waitUntil(
-    caches.open(CACHE_NAME).then((cache) => cache.addAll(["/"])).catch(() => {})
+    caches.open(CACHE_NAME).then((cache) => cache.addAll(PRECACHE_URLS)).catch(() => {})
   );
 });
 
 self.addEventListener("activate", (event) => {
-  event.waitUntil(clients.claim());
+  // Purge old caches on activation
+  event.waitUntil(
+    caches.keys().then((names) =>
+      Promise.all(
+        names
+          .filter((name) => name !== CACHE_NAME)
+          .map((name) => caches.delete(name))
+      )
+    ).then(() => clients.claim())
+  );
 });
 
 // ── Push notification handler ─────────────────────────────────────────────────

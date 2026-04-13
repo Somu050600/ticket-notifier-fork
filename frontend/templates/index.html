@@ -6,6 +6,11 @@
   <title>TicketAlert — Availability Notifier</title>
   <link rel="manifest" href="/manifest.json">
   <meta name="theme-color" content="#8b5cf6">
+  <meta name="apple-mobile-web-app-capable" content="yes">
+  <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+  <meta name="apple-mobile-web-app-title" content="TicketAlert">
+  <link rel="apple-touch-icon" href="/static/icon-192.png">
+  <meta name="description" content="Get alarm-style push notifications when tickets go live on BookMyShow & District">
   <link rel="preconnect" href="https://fonts.googleapis.com">
   <link href="https://fonts.googleapis.com/css2?family=Space+Mono:wght@400;700&family=Syne:wght@400;600;800&display=swap" rel="stylesheet">
 
@@ -660,7 +665,7 @@
           </select>
         </div>
       </div>
-      <div class="form-row" style="grid-template-columns: 1fr; margin-top: 12px;">
+      <div class="form-row" style="grid-template-columns: 1fr 200px auto; margin-top: 12px;">
         <div class="field">
           <label>Fast Checkout URL (optional)</label>
           <input type="url" id="input-checkout-url" placeholder="https://in.bookmyshow.com/buytickets/...">
@@ -673,201 +678,6 @@
           <label style="display:flex;align-items:center;gap:8px;cursor:pointer;">
             <input type="checkbox" id="input-cart-mode" checked style="width:16px;height:16px;accent-color:var(--accent);">
             <span>Cart mode <small style="color:var(--muted)">(add to cart, you pay)</small></span>
-          </label>
-        </div>
-      </div>
-      <div style="margin-top:14px;">
-        <button class="btn-add" onclick="addWatcher()">Start Watching →</button>
-      </div>
-      <div class="form-error" id="form-error"></div>
-      <p class="form-hint">
-        Supports <a href="https://in.bookmyshow.com" target="_blank">BookMyShow</a> &amp;
-        <a href="https://www.district.in" target="_blank">District.in</a> event pages.
-        First scan starts immediately, then checks continue as fast as every 15 seconds.
-      </p>
-    </div>
-
-    <div class="add-form">
-      <h2>Checkout Ready Profile</h2>
-      <div class="form-row">
-        <div class="field">
-          <label>Name</label>
-          <input type="text" id="profile-name" placeholder="Your full name">
-        </div>
-        <div class="field">
-          <label>Email</label>
-          <input type="email" id="profile-email" placeholder="you@example.com">
-        </div>
-        <div class="field">
-          <label>Phone</label>
-          <input type="tel" id="profile-phone" placeholder="+91...">
-        </div>
-      </div>
-      <div class="profile-actions">
-        <button class="btn-secondary" onclick="saveCheckoutProfile()">Save On This Device</button>
-        <button class="btn-secondary" onclick="copyCheckoutProfile()">Copy Profile</button>
-      </div>
-      <p class="form-hint">
-        Saved only in this browser to help you move quickly at checkout.
-        Card details are not stored here, so use browser-saved payment methods and complete OTP manually.
-      </p>
-    </div>
-
-    <!-- Watchers -->
-    <div class="watchers-header">
-      <h2>Watched Events</h2>
-      <span class="watchers-count" id="watchers-count">0 events</span>
-    </div>
-
-    <div class="watchers-list" id="watchers-list">
-      <div class="empty-state" id="empty-state">
-        <div class="empty-icon">🎫</div>
-        <p>No events being watched yet.<br>Add a URL above to get started.</p>
-      </div>
-    </div>
-
-    <!-- How It Works -->
-    <div class="how-section">
-      <h2>How It Works</h2>
-      <div class="steps">
-        <div class="step">
-          <div class="step-num">1</div>
-          <h3>Enable Alerts</h3>
-          <p>Click "Enable Alerts" or allow the prompt when you add your first watch. Works on phones too.</p>
-        </div>
-        <div class="step">
-          <div class="step-num">2</div>
-          <h3>Paste URL</h3>
-          <p>Copy any BookMyShow or District event page URL and paste it above.</p>
-        </div>
-        <div class="step">
-          <div class="step-num">3</div>
-          <h3>We Watch 24/7</h3>
-          <p>Our server runs the first scan immediately, then keeps checking in near real time even when your phone is off.</p>
-        </div>
-        <div class="step">
-          <div class="step-num">4</div>
-          <h3>ALARM!</h3>
-          <p>The moment tickets drop, your phone rings with a loud alarm notification.</p>
-        </div>
-      </div>
-    </div>
-  </main>
-
-  <!-- Alert Banner (tickets available / cart ready / OTP gate) -->
-  <div class="alert-banner" id="alert-banner">
-    <div class="alert-title" id="alert-title">🟢 TICKETS AVAILABLE!</div>
-    <div class="alert-body" id="alert-body">Tickets found for an event you're watching!</div>
-
-    <!-- Cart-ready section — shown when tickets are live -->
-    <div id="cart-section" style="display:none; margin-bottom:12px;">
-      <div style="font-size:12px; color:#aaffcc; margin-bottom:8px;">
-        🎫 Tickets are LIVE! Tap below to open the booking page:
-      </div>
-      <a id="cart-pay-btn" href="#" target="_blank" rel="noopener"
-         onclick="return handleCartPayClick(event)"
-         style="display:block; text-align:center; padding:14px; border-radius:10px;
-                background:linear-gradient(135deg,#7c3aed,#a855f7); color:#fff;
-                font-weight:700; font-size:16px; text-decoration:none; letter-spacing:.3px;
-                box-shadow: 0 6px 20px rgba(124,58,237,.4);">
-        🎫 Book Tickets Now →
-      </a>
-      <div id="cart-url-display" style="font-size:10px; color:#88cc99; margin-top:6px;
-           text-align:center; word-break:break-all; opacity:.7;"></div>
-      <div style="font-size:11px; color:#ffcc00; margin-top:4px; text-align:center; font-weight:600;">
-        ⚡ Opens seat selection directly - be fast!
-      </div>
-    </div>
-
-    <!-- OTP gate — shown when full-checkout mode is waiting for OTP -->
-    <div id="otp-section" style="display:none; margin-bottom:12px;">
-      <div style="font-size:12px; color:#aaffcc; margin-bottom:6px;">
-        ✅ Form auto-filled — enter the OTP sent to your phone:
-      </div>
-      <div style="display:flex; gap:8px;">
-        <input id="otp-input" type="text" inputmode="numeric" maxlength="8"
-               placeholder="Enter OTP"
-               style="flex:1; padding:8px 12px; border-radius:8px; border:1px solid #00e67660;
-                      background:#001a0e; color:#fff; font-size:16px; letter-spacing:4px;
-                      font-family:monospace; text-align:center;">
-        <button class="alert-btn primary" onclick="submitOtp()" style="white-space:nowrap;">
-          Submit OTP
-        </button>
-      </div>
-      <div id="otp-status" style="font-size:11px; color:#aaffcc; margin-top:6px;"></div>
-    </div>
-
-    <div class="alert-actions">
-      <button class="alert-btn primary" id="alert-open-btn">Open Page</button>
-      <button class="alert-btn secondary" onclick="closeAlert()">Dismiss</button>
-    </div>
-  </div>
-
-  <div id="toast"></div>
-
-  <script>
-  const VAPID_PUBLIC_KEY = "{{ vapid_public_key }}";
-  const PROFILE_STORAGE_KEY = 'ticketalert.checkoutProfile';
-
-  // ── Google auth UI + Login Gate ──────────────────────────────────────────────
-  let _isLoggedIn = false;
-
-  (async function initAuth() {
-    const loginGate = document.getElementById('login-gate');
-    try {
-      const res  = await fetch('/auth/me');
-      const user = await res.json();
-      if (user && user.email) {
-        _isLoggedIn = true;
-        // Hide login gate, show app
-        loginGate.style.display = 'none';
-        document.getElementById('login-btn').style.display  = 'none';
-        document.getElementById('user-pill').style.display  = 'flex';
-        document.getElementById('user-name').textContent    = user.name || user.email;
-        document.getElementById('user-avatar').src          = user.picture || '';
-      } else {
-        // Show login gate
-        loginGate.style.display = 'flex';
-        document.getElementById('login-btn').style.display  = 'flex';
-        document.getElementById('user-pill').style.display  = 'none';
-      }
-    } catch(e) {
-      loginGate.style.display = 'flex';
-      document.getElementById('login-btn').style.display = 'flex';
-    }
-    // Show success/error toast from OAuth redirect
-    const p = new URLSearchParams(location.search);
-    if (p.get('auth') === 'success') showToast('Signed in with Google!', 'success');
-    if (p.get('auth') === 'error')   showToast('Google sign-in failed', 'error');
-    if (p.has('auth')) history.replaceState({}, '', '/');
-  })();
-
-  // ── Utilities ───────────────────────────────────────────────────────────────
-  function urlB64ToUint8Array(base64String) {
-    const padding = '='.repeat((4 - base64String.length % 4) % 4);
-    const base64 = (base64String + padding).replace(/-/g, '+').replace(/_/g, '/');
-    const rawData = atob(base64);
-    return Uint8Array.from([...rawData].map(c => c.charCodeAt(0)));
-  }
-
-  function showToast(msg, type = '') {
-    const t = document.getElementById('toast');
-    t.textContent = msg;
-    t.className = 'show ' + type;
-    setTimeout(() => t.className = '', 3000);
-  }
-
-  function showError(msg) {
-    const el = document.getElementById('form-error');
-    el.textContent = msg; el.style.display = 'block';
-    setTimeout(() => el.style.display = 'none', 4000);
-  }
-
-  // ── Service Worker & Push ───────────────────────────────────────────────────
-  let swReg = null;
-  let currentSubscription = null;
-  let swInitPromise = null;
-
           </label>
         </div>
       </div>

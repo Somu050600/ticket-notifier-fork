@@ -3,3 +3,5 @@ data.json
 backend/*.log
 backend/__pycache__/
 *.pyc
+node_modules/
+node-client/node_modules/
