@@ -715,10 +715,23 @@ def stats():
 def update_cart_url(watcher_id):
     """Internal — called by autocheckout to store the captured cart URL."""
     cart_url = (request.json or {}).get("cart_url", "")
+
+    # Validate: reject bare homepage URLs and derive proper booking URL
+    from urllib.parse import urlparse
+    if cart_url:
+        parsed = urlparse(cart_url)
+        if not parsed.path or parsed.path.rstrip('/') == '':
+            logger.warning(f"cart-url for {watcher_id} was homepage ({cart_url}) — deriving proper URL")
+            cart_url = ""  # will be replaced below
+
     with _data_lock:
         data = load_data()
         for w in data["watchers"]:
             if w["id"] == watcher_id:
+                # If cart_url is empty/invalid, derive from the watcher's event URL
+                if not cart_url:
+                    cart_url = _derive_checkout_url(w.get("checkout_url") or w.get("url", ""))
+                    logger.info(f"Derived cart URL for {watcher_id}: {cart_url}")
                 w["cart_url"] = cart_url
                 save_data(data)
                 # Push cart-ready notification to the watcher's owner

@@ -1040,20 +1040,39 @@
     }
   }
 
+  function _isUsefulBookingUrl(url) {
+    if (!url) return false;
+    // Reject bare homepage URLs like "https://in.bookmyshow.com/" or "https://in.bookmyshow.com"
+    try {
+      const u = new URL(url);
+      const path = u.pathname.replace(/\/+$/, '');
+      if (!path || path === '') return false;  // just the homepage
+    } catch(e) { return false; }
+    return true;
+  }
+
+  function _deriveBuyTicketsUrl(rawUrl) {
+    const bmsMatch = rawUrl.match(/in\.bookmyshow\.com\/(?:sports|events)\/([^?#]+)/);
+    if (bmsMatch) {
+      return 'https://in.bookmyshow.com/buytickets/' + bmsMatch[1].replace(/\/+$/, '');
+    }
+    return rawUrl;
+  }
+
   function resolveWatcherTargetUrl(w, { preferCart = true } = {}) {
-    if (preferCart && w.cart_url) return w.cart_url;
+    // Use cart_url only if it's actually a useful booking URL (not homepage)
+    if (preferCart && w.cart_url && _isUsefulBookingUrl(w.cart_url)) return w.cart_url;
 
     let targetUrl = w.checkout_url || w.url || '';
-    const bmsMatch = targetUrl.match(/in\.bookmyshow\.com\/(?:sports|events)\/([^?#]+)/);
-    if (bmsMatch) {
-      targetUrl = 'https://in.bookmyshow.com/buytickets/' + bmsMatch[1].replace(/\/+$/, '');
+    if (targetUrl) {
+      targetUrl = _deriveBuyTicketsUrl(targetUrl);
     }
     return targetUrl;
   }
 
   function isDirectBookingUrl(url) {
     if (!url) return false;
-    return /(ticket-options|cart|checkout|payment|order|booking)/i.test(url);
+    return /(ticket-options|cart|checkout|payment|order|booking|buytickets)/i.test(url);
   }
 
   function openExternalLink(url, { preferNewTab = true } = {}) {
@@ -1369,9 +1388,17 @@
   function showAlertBanner(url, msg, watcherId = null, { awaitCart = false } = {}) {
     document.getElementById('alert-title').textContent = 'TICKETS AVAILABLE!';
     document.getElementById('alert-body').textContent  = msg;
-    _fallbackOpenUrl = url || null;
-    _currentCartUrl = awaitCart ? null : url;
-    updateAlertOpenButton(awaitCart ? null : url, {
+
+    // Ensure the URL is a real booking link, not just the homepage
+    let validUrl = url;
+    if (!_isUsefulBookingUrl(validUrl) && watcherId) {
+      const w = watchers.find(w => w.id === watcherId);
+      if (w) validUrl = _deriveBuyTicketsUrl(w.checkout_url || w.url || '');
+    }
+
+    _fallbackOpenUrl = validUrl || null;
+    _currentCartUrl = awaitCart ? null : validUrl;
+    updateAlertOpenButton(awaitCart ? null : validUrl, {
       enabled: !awaitCart && !!(_currentCartUrl || _fallbackOpenUrl),
       label: awaitCart ? 'Preparing Cart...' : 'Open Page',
     });
@@ -1437,14 +1464,24 @@
 
         if (data.status === 'cart_ready') {
           // Tickets are live — show booking link
-          const cartUrl = data.cart_url || '';
+          let cartUrl = data.cart_url || '';
+
+          // Validate: if cart_url is just the homepage, derive the real buytickets URL
+          if (!_isUsefulBookingUrl(cartUrl)) {
+            // Find the watcher to get its original event URL
+            const w = watchers.find(w => _sessionId && _sessionId.startsWith(w.id));
+            if (w) {
+              cartUrl = _deriveBuyTicketsUrl(w.checkout_url || w.url || '');
+            }
+          }
+
           document.getElementById('cart-section').style.display = 'block';
           document.getElementById('otp-section').style.display  = 'none';
           document.getElementById('alert-title').textContent = 'TICKETS LIVE - BOOK NOW!';
           document.getElementById('alert-body').textContent  =
             'Tap below to open seat selection and book your tickets!';
 
-          if (cartUrl) {
+          if (cartUrl && _isUsefulBookingUrl(cartUrl)) {
             document.getElementById('cart-pay-btn').href = cartUrl;
             document.getElementById('cart-url-display').textContent = cartUrl;
             // Update "Open Page" button to use cart URL too
@@ -1452,9 +1489,18 @@
             _fallbackOpenUrl = cartUrl;
             updateAlertOpenButton(cartUrl, { enabled: true, label: 'Open Cart' });
           } else {
-            document.getElementById('cart-pay-btn').href = '#';
-            document.getElementById('cart-url-display').textContent = 'Waiting for URL...';
-            updateAlertOpenButton(null, { enabled: false, label: 'Preparing Cart...' });
+            // Last resort: use the fallback URL we already have
+            const fallback = _fallbackOpenUrl || '';
+            if (fallback) {
+              document.getElementById('cart-pay-btn').href = fallback;
+              document.getElementById('cart-url-display').textContent = fallback;
+              _currentCartUrl = fallback;
+              updateAlertOpenButton(fallback, { enabled: true, label: 'Open Cart' });
+            } else {
+              document.getElementById('cart-pay-btn').href = '#';
+              document.getElementById('cart-url-display').textContent = 'Waiting for URL...';
+              updateAlertOpenButton(null, { enabled: false, label: 'Preparing Cart...' });
+            }
           }
 
           playAlarmSound();

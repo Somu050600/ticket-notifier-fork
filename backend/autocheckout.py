@@ -1060,6 +1060,20 @@ async def _run_checkout(session_id: str, checkout_url: str, card: dict,
                         message="Cart ready — open the link and pay!",
                         cart_url=cart_url)
                 logger.info(f"[{session_id}] Cart URL: {cart_url}")
+
+                # Validate: if cart_url is just the homepage, derive a proper one
+                if cart_url:
+                    from urllib.parse import urlparse
+                    parsed = urlparse(cart_url)
+                    if not parsed.path or parsed.path.rstrip('/') == '':
+                        better_url = _derive_buytickets_url(checkout_url)
+                        logger.warning(
+                            f"[{session_id}] cart_url was homepage ({cart_url}) "
+                            f"— replaced with {better_url}"
+                        )
+                        cart_url = better_url
+                        _update(session_id, cart_url=cart_url)
+
                 if watcher_id:
                     _notify_cart_ready(watcher_id, cart_url)
                 return
