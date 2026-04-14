@@ -27,11 +27,13 @@ load_dotenv(ROOT_DIR / ".env")
 
 try:
     from .scraper import check_url_availability
+    from . import autocheckout as _autocheckout_mod
     from .autocheckout import (trigger_auto_checkout, get_session,
                                 get_watcher_session, start_worker)
     from .auth import auth_bp, current_user, require_login, user_id
 except ImportError:
     from scraper import check_url_availability
+    import autocheckout as _autocheckout_mod
     from autocheckout import (trigger_auto_checkout, get_session,
                                get_watcher_session, start_worker)
     from auth import auth_bp, current_user, require_login, user_id
@@ -502,6 +504,13 @@ def monitor_loop():
 
 def start_monitor():
     global _monitor_thread
+    # Wire the worker-thread -> app direct callback so cart URLs don't need HTTP.
+    # (This sidesteps 404s when the worker tries to POST back to /api.)
+    try:
+        _autocheckout_mod.set_cart_ready_hook(_store_cart_url)
+        logger.info("Wired in-process cart-ready hook")
+    except Exception as e:
+        logger.warning(f"Could not wire cart-ready hook: {e}")
     start_worker()
     if _monitor_thread and _monitor_thread.is_alive():
         return
@@ -721,32 +730,85 @@ def stats():
         "subscribers": len(data["subscriptions"]),
     })
 
+# ── Strict cart-URL validator ────────────────────────────────────────────────
+# Paths that look like a URL but are NOT a real cart/ticket URL —
+# these are junk landings Playwright sometimes ends up on.
+_JUNK_CART_PATHS = {
+    "", "/", "/cinemas", "/movies", "/home", "/explore", "/search",
+    "/offers", "/login", "/signin", "/signup", "/account", "/profile",
+    "/plays", "/events", "/sports", "/activities", "/comedy",
+}
+# A valid cart URL MUST contain one of these tokens somewhere in the path
+# OR be the platform's buytickets/event page for the same event.
+_VALID_CART_TOKENS = (
+    "buytickets", "cart", "checkout", "payment", "order",
+    "ticket-options", "seat-layout", "booking", "book-now",
+    "/ET",  # BMS event IDs start with ET — e.g. /ET00491084
+)
+
+def _is_valid_cart_url(cart_url: str) -> bool:
+    """True if cart_url looks like a real seat/cart/checkout URL."""
+    if not cart_url or not cart_url.startswith("http"):
+        return False
+    from urllib.parse import urlparse
+    try:
+        parsed = urlparse(cart_url)
+    except Exception:
+        return False
+    path = parsed.path or ""
+    # Reject well-known junk landings
+    if path.rstrip("/").lower() in _JUNK_CART_PATHS:
+        return False
+    # Require a valid cart/ticket token in the URL
+    lowered = cart_url.lower()
+    if not any(tok.lower() in lowered for tok in _VALID_CART_TOKENS):
+        return False
+    return True
+
+
+def _store_cart_url(watcher_id: str, cart_url: str) -> bool:
+    """
+    Internal helper — update the watcher's cart_url and fire notifications.
+    Called both by the HTTP endpoint AND directly by the worker thread.
+    Returns True if successful, False if watcher not found.
+    """
+    # If the URL is junk/missing, we'll derive a fallback from the event URL
+    # (done inside the lock once we have the watcher).
+    with _data_lock:
+        data = load_data()
+        watcher = next((w for w in data["watchers"] if w["id"] == watcher_id), None)
+        if not watcher:
+            logger.warning(f"_store_cart_url: watcher {watcher_id} not found")
+            return False
+
+        # Validate or derive
+        if not _is_valid_cart_url(cart_url):
+            derived = _derive_checkout_url(
+                watcher.get("checkout_url") or watcher.get("url", "")
+            )
+            logger.warning(
+                f"cart-url for {watcher_id} was junk ({cart_url!r}) "
+                f"— using derived: {derived}"
+            )
+            cart_url = derived
+
+        watcher["cart_url"] = cart_url
+        save_data(data)
+
+    # Fire notifications OUTSIDE the lock to avoid holding it during I/O
+    _send_cart_notification(watcher, cart_url)
+    return True
+
+
 @app.route("/api/watchers/<watcher_id>/cart-url", methods=["POST"])
 def update_cart_url(watcher_id):
     """Internal — called by autocheckout to store the captured cart URL."""
+    if not _validate_watcher_id(watcher_id):
+        return jsonify({"error": "Invalid watcher ID"}), 400
     cart_url = (request.json or {}).get("cart_url", "")
-
-    # Validate: reject bare homepage URLs and derive proper booking URL
-    from urllib.parse import urlparse
-    if cart_url:
-        parsed = urlparse(cart_url)
-        if not parsed.path or parsed.path.rstrip('/') == '':
-            logger.warning(f"cart-url for {watcher_id} was homepage ({cart_url}) — deriving proper URL")
-            cart_url = ""  # will be replaced below
-
-    with _data_lock:
-        data = load_data()
-        for w in data["watchers"]:
-            if w["id"] == watcher_id:
-                # If cart_url is empty/invalid, derive from the watcher's event URL
-                if not cart_url:
-                    cart_url = _derive_checkout_url(w.get("checkout_url") or w.get("url", ""))
-                    logger.info(f"Derived cart URL for {watcher_id}: {cart_url}")
-                w["cart_url"] = cart_url
-                save_data(data)
-                # Push cart-ready notification to the watcher's owner
-                _send_cart_notification(w, cart_url)
-                return jsonify({"ok": True})
+    ok = _store_cart_url(watcher_id, cart_url)
+    if ok:
+        return jsonify({"ok": True})
     return jsonify({"error": "Not found"}), 404
 
 

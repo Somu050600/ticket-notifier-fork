@@ -999,21 +999,185 @@ async def _district_set_max_qty(page, session_id: str,
         pass
 
 
+# ── District queue BYPASS helpers ─────────────────────────────────────────────
+
+def _extract_district_event_id(url: str) -> Optional[str]:
+    """
+    Pull the event slug/id out of a District URL.
+    District URLs look like:
+      https://www.district.in/events/<slug>-EVT<N>
+      https://www.district.in/events/<slug>
+    """
+    m = re.search(r"district\.in/(?:events|experiences|shows)/([A-Za-z0-9\-]+)", url)
+    if m:
+        return m.group(1).rstrip("/")
+    return None
+
+
+def _district_bypass_urls(checkout_url: str) -> list:
+    """
+    Build a list of direct-access URLs that may bypass District's waiting room.
+    We try these BEFORE the user-facing event page so the queue never sees us.
+    """
+    slug = _extract_district_event_id(checkout_url)
+    if not slug:
+        return []
+
+    base = "https://www.district.in"
+    ts = int(time.time() * 1000)  # cache-bust
+    urls = [
+        # Direct book/ticket endpoints
+        f"{base}/events/{slug}/book?_t={ts}",
+        f"{base}/events/{slug}/tickets?_t={ts}",
+        f"{base}/events/{slug}/checkout?_t={ts}",
+        f"{base}/book/{slug}?_t={ts}",
+        f"{base}/tickets/{slug}?_t={ts}",
+        # Mobile app deeplink (often skips web queue)
+        f"{base}/m/events/{slug}?_t={ts}",
+        # Event page with cache bust + bypass hint
+        f"{base}/events/{slug}?skipQueue=1&_t={ts}",
+    ]
+    return urls
+
+
+async def _district_clear_queue_cookies(ctx, session_id: str):
+    """Remove known queue/waiting-room cookies to force a fresh session."""
+    try:
+        cookies = await ctx.cookies()
+        keepers = []
+        removed = 0
+        for c in cookies:
+            name = (c.get("name") or "").lower()
+            if any(k in name for k in [
+                "queue", "waiting", "qit", "queueit", "q-pass",
+                "qt-token", "wr-", "waitingroom",
+            ]):
+                removed += 1
+                continue
+            keepers.append(c)
+        if removed:
+            await ctx.clear_cookies()
+            await ctx.add_cookies(keepers)
+            logger.info(f"[{session_id}] Removed {removed} queue cookies")
+    except Exception as e:
+        logger.warning(f"[{session_id}] clear_queue_cookies: {e}")
+
+
+async def _district_try_bypass(page, session_id: str,
+                               checkout_url: str) -> bool:
+    """
+    Try to bypass District's queue by hitting direct endpoints.
+    Returns True if we successfully landed on a ticket-selection page.
+    """
+    bypass_urls = _district_bypass_urls(checkout_url)
+    if not bypass_urls:
+        return False
+
+    _update(session_id, message="Trying District queue bypass...")
+
+    # Set a mobile user-agent hint via extraHTTPHeaders — some queue gates
+    # whitelist the mobile app
+    ctx = page.context
+    try:
+        await ctx.set_extra_http_headers({
+            "X-Requested-With":  "com.district.consumer",
+            "User-Agent-Platform": "Android",
+            "Referer": "https://www.district.in/",
+            "Accept":  "application/json, text/html, */*",
+        })
+    except Exception:
+        pass
+
+    # Clear queue cookies first to avoid being recognized
+    await _district_clear_queue_cookies(ctx, session_id)
+
+    for bypass_url in bypass_urls:
+        try:
+            logger.info(f"[{session_id}] Bypass attempt: {bypass_url}")
+            resp = await page.goto(bypass_url,
+                                   wait_until="domcontentloaded",
+                                   timeout=20_000)
+            if resp and resp.status >= 400:
+                logger.info(f"[{session_id}] Bypass {resp.status} — skip")
+                continue
+
+            await _human_delay(0.8, 1.5)
+            try:
+                await page.wait_for_load_state("networkidle", timeout=6_000)
+            except Exception:
+                pass
+
+            # Did we land on a queue page again?
+            if await _district_in_queue(page):
+                logger.info(f"[{session_id}] Bypass hit queue — try next")
+                continue
+
+            # Did we land on something useful?
+            if await _district_past_queue(page):
+                logger.info(f"[{session_id}] BYPASS SUCCESS via {bypass_url}")
+                _update(session_id,
+                        message="Bypassed queue — picking cheapest seats...")
+                return True
+        except Exception as e:
+            logger.info(f"[{session_id}] Bypass error for {bypass_url}: {e}")
+            continue
+
+    logger.info(f"[{session_id}] All bypass routes failed — falling back")
+    return False
+
+
+async def _district_aggressive_refresh(page, session_id: str,
+                                       max_refreshes: int = 8) -> bool:
+    """
+    When stuck in the queue, aggressively refresh with cache-busters.
+    Sometimes a refresh at the right moment skips ahead in the queue.
+    """
+    ctx = page.context
+    for i in range(max_refreshes):
+        try:
+            await _district_clear_queue_cookies(ctx, session_id)
+            current = page.url.split("?")[0]
+            fresh = f"{current}?_cb={int(time.time()*1000)}{i}"
+            logger.info(f"[{session_id}] Aggressive refresh {i+1}/{max_refreshes}")
+            await page.goto(fresh, wait_until="domcontentloaded", timeout=15_000)
+            await _human_delay(1.0, 2.0)
+            if await _district_past_queue(page):
+                logger.info(f"[{session_id}] Refresh broke through queue!")
+                return True
+        except Exception as e:
+            logger.info(f"[{session_id}] Refresh error: {e}")
+        await asyncio.sleep(2.0)
+    return False
+
+
 async def _run_district_cart(page, session_id: str, target_price: str,
                              watcher_id: str,
-                             max_qty: int = DEFAULT_MAX_QTY) -> str:
+                             max_qty: int = DEFAULT_MAX_QTY,
+                             checkout_url: str = "") -> str:
     """
-    District.in cart flow:
-      1. Detect & wait through queue/waiting-room (up to 10 min)
-      2. Pick cheapest tier (or target price)
-      3. Bump quantity to max
-      4. Click Add to Cart / Proceed
-      5. Capture URL
+    District.in cart flow with AGGRESSIVE queue bypass:
+      0. Try direct bypass URLs (skip web queue entirely)
+      1. If that fails, aggressively refresh with cache-busters
+      2. Fall back to patient queue wait (up to 10 min)
+      3. Pick cheapest tier
+      4. Bump quantity to max
+      5. Add to cart and capture URL
     """
-    _update(session_id, message="On District — checking for queue...")
+    _update(session_id, message="On District — attempting queue bypass...")
 
-    # Step 1: queue handling
-    await _district_wait_through_queue(page, session_id)
+    # ── Step 0: direct-URL bypass (fastest, most reliable) ───────────────
+    bypassed = False
+    if checkout_url:
+        bypassed = await _district_try_bypass(page, session_id, checkout_url)
+
+    # ── Step 0b: if bypass failed and we're in queue, try aggressive refresh
+    if not bypassed and await _district_in_queue(page):
+        _update(session_id, message="In queue — aggressive refresh bypass...")
+        bypassed = await _district_aggressive_refresh(page, session_id)
+
+    # ── Step 1: if STILL in queue, wait it out ──────────────────────────
+    if not bypassed:
+        await _district_wait_through_queue(page, session_id)
 
     # Give the ticket UI a moment to fully render
     await _human_delay(1.0, 2.0)
@@ -1194,22 +1358,20 @@ async def _run_cart(session_id: str, checkout_url: str, target_price: str,
                 )
             elif is_district:
                 cart_url = await _run_district_cart(
-                    page, session_id, target_price, watcher_id, max_qty
+                    page, session_id, target_price, watcher_id, max_qty,
+                    checkout_url=checkout_url,
                 )
             else:
                 cart_url = page.url
 
-            # Validate: if cart_url is just the homepage, derive a proper one
-            if cart_url:
-                from urllib.parse import urlparse
-                parsed = urlparse(cart_url)
-                if not parsed.path or parsed.path.rstrip('/') == '':
-                    better_url = _derive_buytickets_url(checkout_url)
-                    logger.warning(
-                        f"[{session_id}] cart_url was homepage ({cart_url}) "
-                        f"— replaced with {better_url}"
-                    )
-                    cart_url = better_url
+            # Strict validation — reject /cinemas, /movies, /home, root, etc.
+            if not _is_useful_cart_url(cart_url):
+                better_url = _derive_buytickets_url(checkout_url)
+                logger.warning(
+                    f"[{session_id}] cart_url was junk ({cart_url!r}) "
+                    f"— replaced with {better_url}"
+                )
+                cart_url = better_url
 
             # --- NEW: Extract and print cookies to Railway Logs ---
             # --- NEW: Extract and print cookies to Railway Logs ---
@@ -1242,8 +1404,60 @@ async def _run_cart(session_id: str, checkout_url: str, target_price: str,
 # §11  CART NOTIFICATION
 # ═════════════════════════════════════════════════════════════════════════════
 
+# In-process hook — app.py registers _store_cart_url here at startup so the
+# worker can deliver the cart URL directly without an HTTP roundtrip
+# (which was failing with 404 on multi-process setups).
+_cart_ready_hook = None  # type: ignore
+
+
+def set_cart_ready_hook(fn):
+    """Register a callable(watcher_id, cart_url) -> bool to be called from the worker."""
+    global _cart_ready_hook
+    _cart_ready_hook = fn
+
+
+# ── Strict cart-URL filter (same rules as app.py) ─────────────────────────────
+_JUNK_CART_PATHS = {
+    "", "/", "/cinemas", "/movies", "/home", "/explore", "/search",
+    "/offers", "/login", "/signin", "/signup", "/account", "/profile",
+    "/plays", "/events", "/sports", "/activities", "/comedy",
+}
+_VALID_CART_TOKENS = (
+    "buytickets", "cart", "checkout", "payment", "order",
+    "ticket-options", "seat-layout", "booking", "book-now", "/ET",
+)
+
+
+def _is_useful_cart_url(cart_url: str) -> bool:
+    """True if cart_url looks like a real seat/cart/checkout URL."""
+    if not cart_url or not cart_url.startswith("http"):
+        return False
+    from urllib.parse import urlparse
+    try:
+        parsed = urlparse(cart_url)
+    except Exception:
+        return False
+    path = parsed.path or ""
+    if path.rstrip("/").lower() in _JUNK_CART_PATHS:
+        return False
+    lowered = cart_url.lower()
+    if not any(tok.lower() in lowered for tok in _VALID_CART_TOKENS):
+        return False
+    return True
+
+
 def _notify_cart_ready(watcher_id: str, cart_url: str):
-    """POST cart URL back to Flask for Web Push / SMS / email alerts."""
+    """Deliver cart URL to the Flask app. Prefers in-process hook over HTTP."""
+    if _cart_ready_hook is not None:
+        try:
+            ok = _cart_ready_hook(watcher_id, cart_url)
+            if ok:
+                logger.info(f"Cart URL delivered in-process for watcher {watcher_id}")
+                return
+            logger.warning(f"In-process hook returned False for {watcher_id} — falling back to HTTP")
+        except Exception as e:
+            logger.warning(f"In-process hook raised ({e}) — falling back to HTTP")
+
     port = os.environ.get("PORT", "8000")
     try:
         import requests as req
