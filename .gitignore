@@ -6,4 +6,5 @@ backend/__pycache__/
 node_modules/
 node-client/node_modules/
 _push.bat
+_check.bat
 git_output.log
