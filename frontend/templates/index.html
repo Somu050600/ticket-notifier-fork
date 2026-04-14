@@ -671,14 +671,12 @@
           <input type="url" id="input-checkout-url" placeholder="https://in.bookmyshow.com/buytickets/...">
         </div>
         <div class="field">
-          <label>Target Seat Price ₹ (optional)</label>
-          <input type="number" id="input-target-price" placeholder="e.g. 1500 — bot picks this tier">
+          <label>Min Seat Price ₹ (optional)</label>
+          <input type="number" id="input-target-price" placeholder="e.g. 1500 — bot picks cheapest ≥ this">
         </div>
-        <div class="field" style="justify-content:flex-end;align-self:flex-end;">
-          <label style="display:flex;align-items:center;gap:8px;cursor:pointer;">
-            <input type="checkbox" id="input-cart-mode" checked style="width:16px;height:16px;accent-color:var(--accent);">
-            <span>Cart mode <small style="color:var(--muted)">(add to cart, you pay)</small></span>
-          </label>
+        <div class="field">
+          <label>Max Seats (per cart)</label>
+          <input type="number" id="input-max-qty" min="1" max="20" value="10" placeholder="10">
         </div>
       </div>
       <div style="margin-top:14px;">
@@ -689,32 +687,6 @@
         Supports <a href="https://in.bookmyshow.com" target="_blank">BookMyShow</a> &amp;
         <a href="https://www.district.in" target="_blank">District.in</a> event pages.
         First scan starts immediately, then checks continue as fast as every 15 seconds.
-      </p>
-    </div>
-
-    <div class="add-form">
-      <h2>Checkout Ready Profile</h2>
-      <div class="form-row">
-        <div class="field">
-          <label>Name</label>
-          <input type="text" id="profile-name" placeholder="Your full name">
-        </div>
-        <div class="field">
-          <label>Email</label>
-          <input type="email" id="profile-email" placeholder="you@example.com">
-        </div>
-        <div class="field">
-          <label>Phone</label>
-          <input type="tel" id="profile-phone" placeholder="+91...">
-        </div>
-      </div>
-      <div class="profile-actions">
-        <button class="btn-secondary" onclick="saveCheckoutProfile()">Save On This Device</button>
-        <button class="btn-secondary" onclick="copyCheckoutProfile()">Copy Profile</button>
-      </div>
-      <p class="form-hint">
-        Saved only in this browser to help you move quickly at checkout.
-        Card details are not stored here, so use browser-saved payment methods and complete OTP manually.
       </p>
     </div>
 
@@ -759,7 +731,7 @@
     </div>
   </main>
 
-  <!-- Alert Banner (tickets available / cart ready / OTP gate) -->
+  <!-- Alert Banner (tickets available / cart ready) -->
   <div class="alert-banner" id="alert-banner">
     <div class="alert-title" id="alert-title">🟢 TICKETS AVAILABLE!</div>
     <div class="alert-body" id="alert-body">Tickets found for an event you're watching!</div>
@@ -784,24 +756,6 @@
       </div>
     </div>
 
-    <!-- OTP gate — shown when full-checkout mode is waiting for OTP -->
-    <div id="otp-section" style="display:none; margin-bottom:12px;">
-      <div style="font-size:12px; color:#aaffcc; margin-bottom:6px;">
-        ✅ Form auto-filled — enter the OTP sent to your phone:
-      </div>
-      <div style="display:flex; gap:8px;">
-        <input id="otp-input" type="text" inputmode="numeric" maxlength="8"
-               placeholder="Enter OTP"
-               style="flex:1; padding:8px 12px; border-radius:8px; border:1px solid #00e67660;
-                      background:#001a0e; color:#fff; font-size:16px; letter-spacing:4px;
-                      font-family:monospace; text-align:center;">
-        <button class="alert-btn primary" onclick="submitOtp()" style="white-space:nowrap;">
-          Submit OTP
-        </button>
-      </div>
-      <div id="otp-status" style="font-size:11px; color:#aaffcc; margin-top:6px;"></div>
-    </div>
-
     <div class="alert-actions">
       <button class="alert-btn primary" id="alert-open-btn">Open Page</button>
       <button class="alert-btn secondary" onclick="closeAlert()">Dismiss</button>
@@ -812,7 +766,6 @@
 
   <script>
   const VAPID_PUBLIC_KEY = "{{ vapid_public_key }}";
-  const PROFILE_STORAGE_KEY = 'ticketalert.checkoutProfile';
 
   // ── Google auth UI + Login Gate ──────────────────────────────────────────────
   let _isLoggedIn = false;
@@ -1184,63 +1137,14 @@
     return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');
   }
 
-  function loadCheckoutProfile() {
-    try {
-      const raw = localStorage.getItem(PROFILE_STORAGE_KEY);
-      const profile = raw ? JSON.parse(raw) : {};
-      document.getElementById('profile-name').value = profile.name || '';
-      document.getElementById('profile-email').value = profile.email || '';
-      document.getElementById('profile-phone').value = profile.phone || '';
-    } catch (e) {
-      console.warn('Profile load failed:', e);
-    }
-  }
-
-  function getCheckoutProfile() {
-    return {
-      name: document.getElementById('profile-name').value.trim(),
-      email: document.getElementById('profile-email').value.trim(),
-      phone: document.getElementById('profile-phone').value.trim(),
-    };
-  }
-
-  function saveCheckoutProfile() {
-    try {
-      localStorage.setItem(PROFILE_STORAGE_KEY, JSON.stringify(getCheckoutProfile()));
-      showToast('Checkout profile saved on this device', 'success');
-    } catch (e) {
-      showToast('Could not save profile locally', 'error');
-    }
-  }
-
-  async function copyCheckoutProfile() {
-    const profile = getCheckoutProfile();
-    const lines = [
-      profile.name && `Name: ${profile.name}`,
-      profile.email && `Email: ${profile.email}`,
-      profile.phone && `Phone: ${profile.phone}`,
-    ].filter(Boolean);
-
-    if (!lines.length) {
-      showToast('Add profile details first', 'error');
-      return;
-    }
-
-    try {
-      await navigator.clipboard.writeText(lines.join('\n'));
-      showToast('Profile copied for quick checkout', 'success');
-    } catch (e) {
-      showToast('Clipboard access failed', 'error');
-    }
-  }
-
   async function addWatcher() {
     const url         = document.getElementById('input-url').value.trim();
     const checkoutUrl = document.getElementById('input-checkout-url').value.trim();
     const name        = document.getElementById('input-name').value.trim();
     const interval    = parseInt(document.getElementById('input-interval').value);
     const targetPrice = document.getElementById('input-target-price').value.trim();
-    const cartMode    = document.getElementById('input-cart-mode').checked;
+    const maxQtyRaw   = document.getElementById('input-max-qty').value.trim();
+    const maxQty      = Math.max(1, Math.min(20, parseInt(maxQtyRaw || '10', 10) || 10));
     const btn         = document.querySelector('.btn-add');
 
     if (!url) { showError('Please enter an event URL'); return; }
@@ -1258,7 +1162,7 @@
         body: JSON.stringify({ url, checkout_url: checkoutUrl, name,
                                interval_seconds: interval,
                                target_price: targetPrice,
-                               cart_mode: cartMode })
+                               max_qty: maxQty })
       });
       const data = await res.json();
       if (!res.ok) { showError(data.error || 'Failed to add'); return; }
@@ -1404,15 +1308,11 @@
     });
     document.getElementById('alert-banner').classList.add('show');
     document.getElementById('cart-section').style.display = 'none';
-    document.getElementById('otp-section').style.display = 'none';
-    document.getElementById('otp-status').textContent = '';
-    document.getElementById('otp-input').value = '';
-    document.getElementById('otp-input').disabled = false;
 
     playAlarmSound();
     setTimeout(() => closeAlert(), 60000);
 
-    if (watcherId) _claimAndPoll(watcherId);
+    if (watcherId) _startCartPoll(watcherId);
   }
 
   function closeAlert() {
@@ -1424,72 +1324,46 @@
     _fallbackOpenUrl = null;
   }
 
-  // Claim the next free slot, then start polling that session
-  async function _claimAndPoll(watcherId) {
-    try {
-      const res  = await fetch('/api/claim-slot', {
-        method:  'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body:    JSON.stringify({ watcher_id: watcherId, device_id: _deviceId }),
-      });
-      const data = await res.json();
-      if (data.session_id) {
-        _sessionId = data.session_id;
-        const cardNum = data.card_priority;
-        document.getElementById('alert-body').textContent =
-          `🤖 Auto-checkout started with Card #${cardNum} — standby…`;
-        updateAlertOpenButton(null, { enabled: false, label: 'Preparing Cart...' });
-        _startStatusPoll(_sessionId);
-      } else {
-        // No free slot — all cards claimed by other devices
-        document.getElementById('alert-body').textContent =
-          '⚡ All checkout slots claimed by other devices.';
-      }
-    } catch(e) { /* silent */ }
-  }
-
-  // Poll /api/checkout-status/<session_id> every 2 s
-  function _startStatusPoll(sessionId) {
+  // Poll /api/cart-status/<watcher_id> every 2 s — cart-only mode
+  function _startCartPoll(watcherId) {
     if (_otpPollTimer) clearInterval(_otpPollTimer);
+    _sessionId = `${watcherId}-cart`;
+    updateAlertOpenButton(null, { enabled: false, label: 'Preparing Cart...' });
+    document.getElementById('alert-body').textContent =
+      '🤖 Picking cheapest tier and max seats — standby…';
+
     _otpPollTimer = setInterval(async () => {
       try {
-        const res  = await fetch(`/api/checkout-status/${sessionId}`);
+        const res  = await fetch(`/api/cart-status/${watcherId}`);
         const data = await res.json();
-        const card = data.card_priority ? `Card #${data.card_priority}` : 'Card';
 
-        // Update running status message
-        if (data.status === 'running' && data.message) {
+        // Update running/queued status message
+        if ((data.status === 'running' || data.status === 'queued') && data.message) {
           document.getElementById('alert-body').textContent = data.message;
         }
 
         if (data.status === 'cart_ready') {
-          // Tickets are live — show booking link
+          // Cart is ready — show booking link
           let cartUrl = data.cart_url || '';
 
           // Validate: if cart_url is just the homepage, derive the real buytickets URL
           if (!_isUsefulBookingUrl(cartUrl)) {
-            // Find the watcher to get its original event URL
-            const w = watchers.find(w => _sessionId && _sessionId.startsWith(w.id));
-            if (w) {
-              cartUrl = _deriveBuyTicketsUrl(w.checkout_url || w.url || '');
-            }
+            const w = watchers.find(w => w.id === watcherId);
+            if (w) cartUrl = _deriveBuyTicketsUrl(w.checkout_url || w.url || '');
           }
 
           document.getElementById('cart-section').style.display = 'block';
-          document.getElementById('otp-section').style.display  = 'none';
           document.getElementById('alert-title').textContent = 'TICKETS LIVE - BOOK NOW!';
           document.getElementById('alert-body').textContent  =
-            'Tap below to open seat selection and book your tickets!';
+            'Tap below to open your cart and complete payment!';
 
           if (cartUrl && _isUsefulBookingUrl(cartUrl)) {
             document.getElementById('cart-pay-btn').href = cartUrl;
             document.getElementById('cart-url-display').textContent = cartUrl;
-            // Update "Open Page" button to use cart URL too
             _currentCartUrl = cartUrl;
             _fallbackOpenUrl = cartUrl;
             updateAlertOpenButton(cartUrl, { enabled: true, label: 'Open Cart' });
           } else {
-            // Last resort: use the fallback URL we already have
             const fallback = _fallbackOpenUrl || '';
             if (fallback) {
               document.getElementById('cart-pay-btn').href = fallback;
@@ -1506,62 +1380,15 @@
           playAlarmSound();
           clearInterval(_otpPollTimer);
           showToast('Cart ready! Tap to pay.', 'success');
-        } else if (data.status === 'otp_required') {
-          document.getElementById('cart-section').style.display = 'none';
-          document.getElementById('otp-section').style.display  = 'block';
-          document.getElementById('alert-title').textContent = 'OTP REQUIRED';
-          document.getElementById('alert-body').textContent  =
-            `${card} form filled - enter the OTP sent to your phone:`;
-          updateAlertOpenButton(_currentCartUrl || _fallbackOpenUrl, {
-            enabled: !!(_currentCartUrl || _fallbackOpenUrl),
-            label: 'Open Cart',
-          });
-          clearInterval(_otpPollTimer);
-        } else if (data.status === 'success') {
-          document.getElementById('cart-section').style.display = 'none';
-          document.getElementById('otp-section').style.display  = 'none';
-          document.getElementById('alert-title').textContent = 'BOOKED!';
-          document.getElementById('alert-body').textContent  =
-            `${card} booking confirmed! Check your email.`;
-          clearInterval(_otpPollTimer);
-          stopAlarmSound();
-          showToast('Booking confirmed!', 'success');
         } else if (data.status === 'failed') {
           document.getElementById('cart-section').style.display = 'none';
-          document.getElementById('otp-section').style.display  = 'none';
-          document.getElementById('alert-body').textContent  =
-            `${card} failed: ${data.message}`;
+          document.getElementById('alert-body').textContent =
+            `Cart build failed: ${data.message || 'unknown error'}`;
           clearInterval(_otpPollTimer);
           stopAlarmSound();
         }
       } catch(e) { /* silent */ }
     }, 2000);
-  }
-
-  // Submit OTP — sends to THIS device's session only
-  async function submitOtp() {
-    const otp     = document.getElementById('otp-input').value.trim();
-    const statusEl = document.getElementById('otp-status');
-    if (!otp || !_sessionId) return;
-
-    statusEl.textContent = 'Submitting OTP…';
-    try {
-      const res = await fetch('/api/submit-otp', {
-        method:  'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body:    JSON.stringify({ session_id: _sessionId, otp }),
-      });
-      const data = await res.json();
-      if (data.ok) {
-        statusEl.textContent = '✅ OTP sent — completing booking…';
-        document.getElementById('otp-input').disabled = true;
-        _startStatusPoll(_sessionId);   // resume polling for final result
-      } else {
-        statusEl.textContent = '❌ Failed — try again.';
-      }
-    } catch(e) {
-      statusEl.textContent = '❌ Network error — try again.';
-    }
   }
 
   // ── LOUD repeating alarm ──────────────────────────────────────────────────
@@ -1637,7 +1464,6 @@
   }
 
   // ── Init ─────────────────────────────────────────────────────────────────────
-  loadCheckoutProfile();
   initSW();
   poll();
   setInterval(poll, 5000); // refresh UI every 5s

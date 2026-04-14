@@ -1,45 +1,43 @@
 """
-autocheckout.py — Production-Grade Headless Booking Engine
-==========================================================
+autocheckout.py — Cart-Only Booking Engine
+==========================================
 
 Architecture Overview
 ---------------------
-This module implements a fully isolated, thread-safe booking engine that
-communicates with the Flask web layer exclusively through a thread-safe
-``queue.Queue`` and a lock-protected session dict.
+Cart-only mode: always picks the CHEAPEST price tier and MAX AVAILABLE seats,
+adds them to cart, and returns the cart/checkout link to the user. The user
+completes payment manually — we never touch OTP or cards.
 
 Key Design Decisions:
   1. **Dedicated asyncio event loop in a background daemon thread.**
-     Flask/Gunicorn is WSGI (synchronous). Playwright is async. Running them
-     in the same thread or event loop causes deadlocks. We spin up ONE
-     persistent background thread that owns its own ``asyncio.EventLoop``
-     and processes booking jobs from a queue.
+     Flask/Gunicorn is WSGI (synchronous). Playwright is async. We spin up ONE
+     persistent background thread that owns its own asyncio loop and processes
+     booking jobs from a queue.
 
   2. **Residential proxy with sticky sessions.**
      Akamai Bot Manager fingerprints datacenter IPs instantly. We route ALL
      Playwright traffic through a residential proxy whose username includes
-     a per-session UUID. This guarantees the exit IP stays constant for the
-     entire booking flow, preventing ``_abck`` / ``bm_sz`` cookie
-     invalidation mid-checkout.
+     a per-session UUID — guarantees exit IP stays constant and prevents
+     ``_abck`` / ``bm_sz`` cookie invalidation mid-cart.
 
   3. **Network interception instead of blind waits.**
-     Ticketing platforms use a two-phase commit: when a seat is clicked, an
-     XHR fires to acquire a pessimistic lock (Redis seat-lock). We use
-     ``page.expect_response()`` to wait for the backend lock API to return
-     200 before navigating forward. This eliminates the redirect-loop caused
-     by navigating before the lock is confirmed.
+     When a seat is clicked, an XHR fires to acquire a pessimistic lock.
+     We use ``page.expect_response()`` to wait for the backend lock API.
+     This eliminates the redirect-loop caused by navigating too early.
 
-  4. **playwright-stealth for fingerprint masking.**
+  4. **District.in queue/waiting-room handler.**
+     District puts high-demand events behind a queue. We detect the queue page
+     via known selectors ("you are in line", "position in queue", etc.) and
+     poll patiently (up to 10 minutes) until we're through, then proceed.
+
+  5. **playwright-stealth v2 for fingerprint masking.**
      Patches ``navigator.webdriver``, plugin arrays, WebGL renderer strings,
-     Chrome runtime objects, and dozens of other signals that Akamai checks.
+     Chrome runtime objects, and dozens of other Akamai signals.
 
 Environment Variables (set in Railway dashboard):
   PROXY_SERVER        — e.g. ``gate.smartproxy.com:7000``
   PROXY_USERNAME      — e.g. ``sp1234user``
   PROXY_PASSWORD      — e.g. ``secretpass``
-  CARD_1_NUMBER … CARD_3_NUMBER  — payment card pool (full-checkout only)
-  CARD_1_EXPIRY … CARD_3_CVV     — expiry/CVV for each card
-  PROFILE_NAME / PROFILE_EMAIL / PROFILE_PHONE — autofill identity
 """
 
 # ── stdlib ───────────────────────────────────────────────────────────────────
@@ -51,7 +49,6 @@ import random
 import re
 import threading
 import time
-import uuid
 from typing import Optional
 
 logger = logging.getLogger("ticketalert.checkout")
@@ -66,11 +63,15 @@ PROXY_USERNAME = os.environ.get("PROXY_USERNAME", "")
 PROXY_PASSWORD = os.environ.get("PROXY_PASSWORD", "")
 
 # Timeouts (milliseconds for Playwright, seconds for Python)
-NAV_TIMEOUT_MS       = 45_000   # page.goto max wait
-NETWORK_IDLE_MS      = 15_000   # wait_for_load_state("networkidle")
-SEAT_LOCK_TIMEOUT_MS = 12_000   # max wait for seat-lock XHR response
-ELEMENT_TIMEOUT_MS   = 8_000    # locator visibility wait
-OTP_TIMEOUT_S        = 300      # 5 minutes to receive OTP
+NAV_TIMEOUT_MS         = 45_000   # page.goto max wait
+NETWORK_IDLE_MS        = 15_000   # wait_for_load_state("networkidle")
+SEAT_LOCK_TIMEOUT_MS   = 12_000   # max wait for seat-lock XHR response
+ELEMENT_TIMEOUT_MS     = 8_000    # locator visibility wait
+DISTRICT_QUEUE_POLL_S  = 4        # poll queue page every 4s
+DISTRICT_QUEUE_MAX_S   = 600      # give up queue after 10 min
+
+# Maximum seats to try to grab — we always go for the max available.
+DEFAULT_MAX_QTY = 10
 
 # User-Agent pool — real desktop Chrome strings
 USER_AGENTS = [
@@ -123,8 +124,8 @@ BMS_BOOK = [
     "a:has-text('Book')",
 ]
 
-# Patterns the network interceptor watches for — these are the XHR endpoints
-# that BookMyShow hits when locking seats in their backend.
+# Patterns the network interceptor watches for — XHR endpoints that BMS hits
+# when locking seats in their backend.
 SEAT_LOCK_URL_PATTERNS = [
     "seats/lock",
     "blockseats",
@@ -138,71 +139,45 @@ SEAT_LOCK_URL_PATTERNS = [
     "ticket-options",
 ]
 
-OTP_SCREEN_SELECTORS = [
-    "input[placeholder*='OTP' i]",
-    "input[name*='otp' i]",
-    "input[id*='otp' i]",
-    "input[autocomplete='one-time-code']",
-    "[class*='otp' i] input",
+# ── District.in queue/waiting-room selectors ────────────────────────────────
+
+DISTRICT_QUEUE_SELECTORS = [
+    "text=/you are in line/i",
+    "text=/you're in line/i",
+    "text=/waiting room/i",
+    "text=/position in (the )?queue/i",
+    "text=/estimated wait/i",
+    "text=/please wait/i",
+    "[class*='queue' i]",
+    "[class*='waiting-room' i]",
+    "[class*='waitingRoom']",
+    "[id*='queue' i]",
+    "[data-queue]",
 ]
 
-SUCCESS_PATTERNS = [
-    "confirmed", "success", "booking confirmed",
-    "order confirmed", "thank you",
-]
-
-FAILURE_PATTERNS = [
-    "failed", "declined", "error", "invalid",
-    "expired", "try again",
+# If any of these are visible, we know we've made it through the queue
+DISTRICT_THROUGH_QUEUE_SELECTORS = [
+    "[class*='ticket-card']",
+    "[class*='tier']",
+    "[class*='seat']",
+    "text=/select.*ticket/i",
+    "text=/choose.*seat/i",
+    "button:has-text('Buy')",
+    "button:has-text('Get Tickets')",
+    "button:has-text('Book')",
 ]
 
 
 # ═════════════════════════════════════════════════════════════════════════════
-# §2  CARD POOL & PROFILE
-# ═════════════════════════════════════════════════════════════════════════════
-
-def _load_card_pool() -> list[dict]:
-    """Load up to 3 payment cards from environment variables."""
-    pool = []
-    for n in range(1, 4):
-        number = (
-            os.environ.get(f"CARD_{n}_NUMBER")
-            or (os.environ.get("CARD_NUMBER") if n == 1 else "")
-        )
-        if not number:
-            continue
-        pool.append({
-            "priority": n,
-            "number":   number,
-            "expiry":   os.environ.get(f"CARD_{n}_EXPIRY",
-                                       os.environ.get("CARD_EXPIRY", "")),
-            "cvv":      os.environ.get(f"CARD_{n}_CVV",
-                                       os.environ.get("CARD_CVV", "")),
-            "name":     os.environ.get(f"CARD_{n}_NAME",
-                                       os.environ.get("PROFILE_NAME", "")),
-        })
-    return pool
-
-
-def _profile() -> dict:
-    """Load autofill identity from environment."""
-    return {
-        "name":  os.environ.get("PROFILE_NAME",  ""),
-        "email": os.environ.get("PROFILE_EMAIL", ""),
-        "phone": os.environ.get("PROFILE_PHONE", ""),
-    }
-
-
-# ═════════════════════════════════════════════════════════════════════════════
-# §3  SESSION STATE (thread-safe)
+# §2  SESSION STATE (thread-safe)
 # ═════════════════════════════════════════════════════════════════════════════
 
 _sessions: dict[str, dict] = {}
 _sessions_lock = threading.Lock()
 
 
-def _session_id(watcher_id: str, priority: int) -> str:
-    return f"{watcher_id}-slot-{priority}"
+def _session_id(watcher_id: str) -> str:
+    return f"{watcher_id}-cart"
 
 
 def _update(session_id: str, **kwargs):
@@ -219,94 +194,57 @@ def _cleanup_stale_sessions(max_age_s: int = 1800):
         stale = [
             sid for sid, s in _sessions.items()
             if now - s.get("created_at", now) > max_age_s
-            and s.get("status") not in ("running", "otp_required")
+            and s.get("status") != "running"
         ]
         for sid in stale:
             del _sessions[sid]
     if stale:
-        logger.info(f"Cleaned up {len(stale)} stale checkout sessions")
+        logger.info(f"Cleaned up {len(stale)} stale cart sessions")
 
 
 # ── Public API for Flask routes ──────────────────────────────────────────────
 
 def get_session(session_id: str) -> dict:
-    """Returns session state for frontend polling via /api/checkout-status/."""
+    """Returns session state for frontend polling."""
     with _sessions_lock:
         sess = _sessions.get(session_id, {})
     return {
-        "status":        sess.get("status", "idle"),
-        "message":       sess.get("message", ""),
-        "card_priority": sess.get("card_priority", 0),
-        "device_id":     sess.get("device_id"),
-        "cart_url":      sess.get("cart_url"),
+        "status":   sess.get("status", "idle"),
+        "message":  sess.get("message", ""),
+        "cart_url": sess.get("cart_url"),
     }
 
 
-def get_session_for_device(watcher_id: str, device_id: str) -> dict:
-    """Find session assigned to a specific device."""
-    with _sessions_lock:
-        for priority in range(1, 4):
-            sid = _session_id(watcher_id, priority)
-            sess = _sessions.get(sid)
-            if sess and sess.get("device_id") == device_id:
-                return {**get_session(sid), "session_id": sid}
-    return {"status": "idle", "message": "", "session_id": None}
-
-
-def claim_slot(watcher_id: str, device_id: str) -> Optional[str]:
-    """A device claims the next available checkout slot."""
-    with _sessions_lock:
-        for priority in range(1, 4):
-            sid = _session_id(watcher_id, priority)
-            sess = _sessions.get(sid)
-            if (sess
-                    and sess.get("status") in ("running", "otp_required", "cart_ready")
-                    and sess.get("device_id") is None):
-                sess["device_id"] = device_id
-                logger.info(f"[{sid}] Claimed by device {device_id}")
-                return sid
-        for priority in range(1, 4):
-            sid = _session_id(watcher_id, priority)
-            sess = _sessions.get(sid)
-            if sess and sess.get("device_id") == device_id:
-                return sid
-    return None
-
-
-def inject_otp(session_id: str, otp: str):
-    """Receive OTP from user and store it for the worker to pick up."""
-    with _sessions_lock:
-        if session_id in _sessions:
-            _sessions[session_id]["otp"] = otp
-            logger.info(f"[{session_id}] OTP injected")
+def get_watcher_session(watcher_id: str) -> dict:
+    """Get the cart session for a watcher."""
+    sid = _session_id(watcher_id)
+    return {**get_session(sid), "session_id": sid}
 
 
 # ═════════════════════════════════════════════════════════════════════════════
-# §4  JOB QUEUE — Flask → Worker communication
+# §3  JOB QUEUE — Flask → Worker communication
 # ═════════════════════════════════════════════════════════════════════════════
 
 _job_queue: queue.Queue = queue.Queue(maxsize=100)
 
 
 class BookingJob:
-    """Immutable value object representing a single booking request."""
-    __slots__ = (
-        "watcher_id", "checkout_url", "cart_mode",
-        "target_price", "owner_email",
-    )
+    """Immutable value object representing a single cart request."""
+    __slots__ = ("watcher_id", "checkout_url", "target_price",
+                 "max_qty", "owner_email")
 
     def __init__(self, watcher_id: str, checkout_url: str,
-                 cart_mode: bool = True, target_price: str = "",
+                 target_price: str = "", max_qty: int = DEFAULT_MAX_QTY,
                  owner_email: str = ""):
         self.watcher_id   = watcher_id
-        self.checkout_url  = checkout_url
-        self.cart_mode     = cart_mode
-        self.target_price  = target_price
-        self.owner_email   = owner_email
+        self.checkout_url = checkout_url
+        self.target_price = target_price
+        self.max_qty      = max_qty or DEFAULT_MAX_QTY
+        self.owner_email  = owner_email
 
 
 # ═════════════════════════════════════════════════════════════════════════════
-# §5  HUMAN-LIKE INTERACTION HELPERS
+# §4  HUMAN-LIKE INTERACTION HELPERS
 # ═════════════════════════════════════════════════════════════════════════════
 
 async def _human_delay(lo: float = 0.3, hi: float = 1.0):
@@ -355,23 +293,6 @@ async def _human_scroll(page, distance: int = 400):
         await _human_delay(0.04, 0.12)
 
 
-async def _human_fill(scope, selector: str, value: str,
-                      timeout: int = ELEMENT_TIMEOUT_MS):
-    """Type into an input field character-by-character."""
-    if not value:
-        return
-    try:
-        loc = scope.locator(selector).first
-        await loc.wait_for(state="visible", timeout=timeout)
-        await loc.click()
-        await _human_delay(0.1, 0.3)
-        for ch in value:
-            await loc.type(ch, delay=random.randint(40, 120))
-        await _human_delay(0.1, 0.3)
-    except Exception:
-        pass
-
-
 async def _try_click_first(page, selectors: list,
                            timeout: int = 5_000) -> bool:
     """Try each selector in order; click the first visible one."""
@@ -382,17 +303,16 @@ async def _try_click_first(page, selectors: list,
 
 
 # ═════════════════════════════════════════════════════════════════════════════
-# §6  PROXY CONFIGURATION — Sticky Sessions
+# §5  PROXY CONFIGURATION — Sticky Sessions
 # ═════════════════════════════════════════════════════════════════════════════
 
 def _build_proxy_config() -> Optional[dict]:
     """
     Build Playwright proxy dict with a sticky session.
 
-    The proxy username is suffixed with a unique session UUID so that the
-    residential proxy provider assigns and KEEPS a single exit IP for the
-    entire browser context lifetime.  This prevents Akamai from seeing
-    different IPs between page loads and invalidating _abck cookies.
+    The proxy username is suffixed with a unique session UUID so the residential
+    proxy provider keeps a single exit IP for the entire browser context
+    lifetime, preventing Akamai from invalidating _abck cookies between loads.
     """
     if not all([PROXY_SERVER, PROXY_USERNAME, PROXY_PASSWORD]):
         logger.warning(
@@ -412,16 +332,13 @@ def _build_proxy_config() -> Optional[dict]:
 
 
 # ═════════════════════════════════════════════════════════════════════════════
-# §7  NETWORK INTERCEPTION — Seat Lock Verification
+# §6  NETWORK INTERCEPTION — Seat Lock Verification
 # ═════════════════════════════════════════════════════════════════════════════
 
 async def _wait_for_seat_lock(page, session_id: str,
                               timeout_ms: int = SEAT_LOCK_TIMEOUT_MS) -> Optional[dict]:
     """
     Monitor the network layer for a seat-lock / cart-creation API response.
-
-    Instead of blindly waiting after clicking a seat, we intercept the
-    actual XHR/Fetch call that BMS fires to acquire a pessimistic lock.
     We do NOT navigate forward until this returns 200.
     """
     _update(session_id, message="Waiting for seat lock confirmation...")
@@ -463,7 +380,7 @@ async def _wait_for_seat_lock(page, session_id: str,
 
 
 # ═════════════════════════════════════════════════════════════════════════════
-# §8  BOOKMYSHOW CART FLOW
+# §7  BOOKMYSHOW CART FLOW
 # ═════════════════════════════════════════════════════════════════════════════
 
 async def _bms_handle_popups(page, session_id: str):
@@ -489,9 +406,12 @@ async def _bms_handle_popups(page, session_id: str):
             pass
 
 
-async def _bms_select_quantity(page, session_id: str, max_qty: int = 10):
-    """Handle BookMyShow 'How many seats?' popup."""
-    _update(session_id, message="Selecting seat quantity...")
+async def _bms_select_quantity(page, session_id: str, max_qty: int = DEFAULT_MAX_QTY):
+    """
+    Handle BookMyShow 'How many seats?' popup — always pick the MAXIMUM
+    quantity that the dialog offers (up to max_qty).
+    """
+    _update(session_id, message="Selecting max seat quantity...")
 
     dialog_found = False
     for sel in BMS_QTY_DETECT:
@@ -509,16 +429,17 @@ async def _bms_select_quantity(page, session_id: str, max_qty: int = 10):
     await _human_delay(0.5, 1.0)
 
     selected = False
-    for qty in [max_qty, 10, 8, 6, 4, 2, 1]:
+    # Try each quantity from max down to 1 — first visible wins
+    for qty in list(range(max_qty, 0, -1)):
         if selected:
             break
         for tag in ["div", "span", "button", "li", "a"]:
             try:
                 num_loc = page.locator(f"{tag}:text-is('{qty}')").first
-                if await num_loc.is_visible(timeout=1_200):
+                if await num_loc.is_visible(timeout=800):
                     await _human_click(page, num_loc)
                     selected = True
-                    logger.info(f"[{session_id}] Selected quantity: {qty}")
+                    logger.info(f"[{session_id}] Selected max quantity: {qty}")
                     break
             except Exception:
                 continue
@@ -554,8 +475,12 @@ async def _bms_select_quantity(page, session_id: str, max_qty: int = 10):
     return True
 
 
-async def _bms_select_category(page, session_id: str, target_price: str = ""):
-    """Select seat category — target_price if set, otherwise cheapest."""
+async def _bms_select_cheapest_category(page, session_id: str,
+                                        target_price: str = ""):
+    """
+    Select the CHEAPEST seat category available. If target_price is set, prefer
+    that exact price, else the minimum price tier among visible categories.
+    """
     label = f" at Rs.{target_price}" if target_price else " (cheapest)"
     _update(session_id, message=f"Selecting seat category{label}...")
 
@@ -582,6 +507,10 @@ async def _bms_select_category(page, session_id: str, target_price: str = ""):
             items = await page.locator(container_sel).all()
             for item in items:
                 text = (await item.text_content() or "").replace(",", "").replace("\u20b9", "")
+                # Skip categories clearly marked as sold-out
+                if any(k in text.lower() for k in
+                       ["sold out", "unavailable", "coming soon"]):
+                    continue
                 nums = re.findall(r"\d+", text)
                 for num_str in nums:
                     val = int(num_str)
@@ -594,6 +523,7 @@ async def _bms_select_category(page, session_id: str, target_price: str = ""):
             continue
 
     if not candidates:
+        # Fallback: search page text for typical price strings
         for price_str in ["499", "500", "750", "999", "1000", "1250", "1500",
                           "1750", "2000", "2500", "3000", "5000", "7500",
                           "10000", "15000", "20000"]:
@@ -609,6 +539,7 @@ async def _bms_select_category(page, session_id: str, target_price: str = ""):
         logger.warning(f"[{session_id}] No seat categories found")
         return False
 
+    # Dedupe by price and sort ascending — cheapest first
     seen = set()
     unique = []
     for val, el, txt in candidates:
@@ -620,15 +551,18 @@ async def _bms_select_category(page, session_id: str, target_price: str = ""):
 
     chosen = None
     if target_num:
+        # Exact match first
         for c in candidates:
             if c[0] == target_num:
                 chosen = c
                 break
+        # Otherwise cheapest that is >= target (respect user's min price)
         if not chosen:
             for c in candidates:
                 if c[0] >= target_num:
                     chosen = c
                     break
+    # Fallback: absolute cheapest
     if not chosen:
         chosen = candidates[0]
 
@@ -676,9 +610,9 @@ async def _bms_select_subsection(page, session_id: str):
     return True
 
 
-async def _bms_select_seats(page, session_id: str, qty: int = 10):
-    """Select available seats on the stadium map."""
-    _update(session_id, message=f"Selecting {qty} seats on map...")
+async def _bms_select_max_seats(page, session_id: str, qty: int = DEFAULT_MAX_QTY):
+    """Select as many available seats as possible on the stadium map (up to qty)."""
+    _update(session_id, message=f"Selecting up to {qty} seats on map...")
     await _human_delay(1.0, 2.0)
     selected = 0
 
@@ -802,21 +736,21 @@ async def _bms_capture_url(page, session_id: str) -> str:
 
 
 async def _run_bms_cart(page, session_id: str, target_price: str,
-                        watcher_id: str, max_qty: int = 10) -> str:
+                        watcher_id: str, max_qty: int = DEFAULT_MAX_QTY) -> str:
     """
-    Complete BookMyShow booking flow with network interception:
-      buytickets → qty → continue → stadium map
-      → category → subsection → seats → WAIT FOR SEAT LOCK → Book → URL
+    Complete BookMyShow cart flow:
+      popups → qty(max) → continue → category(cheapest) → subsection
+      → seats(max) → WAIT FOR SEAT LOCK → Book → capture cart URL
     """
     await _bms_handle_popups(page, session_id)
     await _bms_select_quantity(page, session_id, max_qty)
     await _human_delay(0.5, 1.0)
     logger.info(f"[{session_id}] After qty: {page.url}")
 
-    await _bms_select_category(page, session_id, target_price)
+    await _bms_select_cheapest_category(page, session_id, target_price)
     await _bms_select_subsection(page, session_id)
 
-    seats_selected = await _bms_select_seats(page, session_id, max_qty)
+    seats_selected = await _bms_select_max_seats(page, session_id, max_qty)
 
     # ── NETWORK INTERCEPTION — wait for seat lock before proceeding ──────
     if seats_selected:
@@ -850,47 +784,260 @@ async def _run_bms_cart(page, session_id: str, target_price: str,
 
 
 # ═════════════════════════════════════════════════════════════════════════════
-# §9  DISTRICT.IN CART FLOW
+# §8  DISTRICT.IN CART FLOW (with queue/waiting-room handler)
 # ═════════════════════════════════════════════════════════════════════════════
 
-async def _run_district_cart(page, session_id: str, target_price: str,
-                             watcher_id: str) -> str:
-    """District.in: event page → select tier → add to cart → capture URL."""
-    _update(session_id, message="Selecting tickets on District...")
-    await _human_delay(1.0, 2.0)
+async def _district_in_queue(page) -> bool:
+    """Return True if the page is currently a queue/waiting-room screen."""
+    for sel in DISTRICT_QUEUE_SELECTORS:
+        try:
+            loc = page.locator(sel).first
+            if await loc.is_visible(timeout=800):
+                return True
+        except Exception:
+            continue
+    # Also check URL
+    url_lower = page.url.lower()
+    if any(k in url_lower for k in ["queue", "waitingroom", "waiting-room"]):
+        return True
+    return False
 
-    if target_price:
-        target_num = int("".join(filter(str.isdigit, str(target_price))) or "0")
-        if target_num:
+
+async def _district_past_queue(page) -> bool:
+    """Return True if we appear to be on the ticket selection page."""
+    for sel in DISTRICT_THROUGH_QUEUE_SELECTORS:
+        try:
+            loc = page.locator(sel).first
+            if await loc.is_visible(timeout=800):
+                return True
+        except Exception:
+            continue
+    return False
+
+
+async def _district_wait_through_queue(page, session_id: str) -> bool:
+    """
+    If District shows a queue/waiting-room, poll until we're through or time
+    out. Returns True once we see ticket-selection elements (or if no queue
+    was present to begin with).
+    """
+    in_queue = await _district_in_queue(page)
+    if not in_queue:
+        return True
+
+    logger.info(f"[{session_id}] Queue detected — waiting up to "
+                f"{DISTRICT_QUEUE_MAX_S}s to be let through")
+    _update(session_id, status="queued",
+            message="You're in line on District — waiting for our turn...")
+
+    deadline = time.time() + DISTRICT_QUEUE_MAX_S
+    last_position_log = 0.0
+
+    while time.time() < deadline:
+        # Poll for position/ETA text and log it every ~20s
+        if time.time() - last_position_log > 20:
             try:
-                tiers = await page.locator("[class*='ticket'], [class*='tier']").all()
-                for tier in tiers:
-                    text = (await tier.text_content() or "").replace(",", "")
-                    nums = re.findall(r"\d+", text)
-                    for n in nums:
-                        if int(n) == target_num:
-                            await _human_click(page, tier)
-                            await _human_delay(1.0, 2.0)
+                for sel in [
+                    "text=/position.*\\d+/i",
+                    "text=/\\d+.*ahead/i",
+                    "text=/estimated wait.*\\d+/i",
+                    "[class*='position' i]",
+                    "[class*='eta' i]",
+                ]:
+                    loc = page.locator(sel).first
+                    if await loc.is_visible(timeout=500):
+                        info = (await loc.text_content() or "").strip()[:120]
+                        if info:
+                            _update(session_id,
+                                    message=f"In queue: {info}")
+                            logger.info(f"[{session_id}] Queue status: {info}")
                             break
             except Exception:
                 pass
+            last_position_log = time.time()
 
+        # Wait a few seconds, then re-check both states
+        await asyncio.sleep(DISTRICT_QUEUE_POLL_S)
+
+        # If we're past the queue, success
+        if await _district_past_queue(page):
+            logger.info(f"[{session_id}] Through the queue — proceeding")
+            _update(session_id, status="running",
+                    message="Through the queue! Picking cheapest seats...")
+            return True
+
+        # Still in queue? Keep waiting. If queue markers disappeared but we
+        # don't see ticket UI yet, give networkidle a chance.
+        if not await _district_in_queue(page):
+            try:
+                await page.wait_for_load_state("networkidle", timeout=5_000)
+            except Exception:
+                pass
+            if await _district_past_queue(page):
+                logger.info(f"[{session_id}] Through the queue (after idle)")
+                _update(session_id, status="running",
+                        message="Through the queue! Picking cheapest seats...")
+                return True
+
+    logger.warning(f"[{session_id}] Queue wait timed out after "
+                   f"{DISTRICT_QUEUE_MAX_S}s")
+    _update(session_id, message="Queue wait timed out — trying anyway...")
+    return False
+
+
+async def _district_pick_cheapest_tier(page, session_id: str,
+                                       target_price: str = "") -> bool:
+    """
+    Pick the cheapest ticket tier on District. Prefer target_price if set,
+    otherwise minimum price.
+    """
+    _update(session_id, message="Picking cheapest ticket tier on District...")
+    await _human_delay(0.8, 1.5)
+
+    target_num = 0
+    if target_price:
+        target_num = int("".join(filter(str.isdigit, str(target_price))) or "0")
+
+    candidates = []
     tier_selectors = [
-        "[class*='ticket-card']:not([class*='sold'])",
-        "[class*='tier']:not([class*='unavailable'])",
-        "button:has-text('Buy')",
-        "button:has-text('Get Tickets')",
-        "button:has-text('Book')",
-        "a:has-text('Buy Tickets')",
+        "[class*='ticket-card']",
+        "[class*='ticketCard']",
+        "[class*='tier-card']",
+        "[class*='tier']",
+        "[class*='price-card']",
+        "[class*='ticket-option']",
     ]
-    await _try_click_first(page, tier_selectors, timeout=5_000)
-    await _human_delay(1.5, 3.0)
 
+    for sel in tier_selectors:
+        try:
+            items = await page.locator(sel).all()
+            for item in items:
+                text = (await item.text_content() or "").replace(",", "").replace("\u20b9", "")
+                # Skip sold-out tiers
+                if any(k in text.lower() for k in
+                       ["sold out", "unavailable", "coming soon", "waitlist"]):
+                    continue
+                cls = (await item.get_attribute("class") or "").lower()
+                if any(k in cls for k in ["sold", "unavailable", "disabled"]):
+                    continue
+                nums = re.findall(r"\d+", text)
+                for n in nums:
+                    val = int(n)
+                    if 50 <= val <= 200_000:
+                        candidates.append((val, item, text.strip()[:80]))
+                        break
+            if candidates:
+                break
+        except Exception:
+            continue
+
+    if not candidates:
+        logger.info(f"[{session_id}] No explicit tiers — falling back to button click")
+        return await _try_click_first(page, [
+            "button:has-text('Buy')",
+            "button:has-text('Get Tickets')",
+            "button:has-text('Book')",
+            "a:has-text('Buy Tickets')",
+        ], timeout=5_000)
+
+    # Dedupe & sort ascending
+    seen = set()
+    unique = []
+    for val, el, txt in candidates:
+        if val not in seen:
+            seen.add(val)
+            unique.append((val, el, txt))
+    candidates = sorted(unique, key=lambda x: x[0])
+    logger.info(f"[{session_id}] District tiers: "
+                f"{[f'Rs.{c[0]}' for c in candidates]}")
+
+    chosen = None
+    if target_num:
+        for c in candidates:
+            if c[0] == target_num:
+                chosen = c
+                break
+        if not chosen:
+            for c in candidates:
+                if c[0] >= target_num:
+                    chosen = c
+                    break
+    if not chosen:
+        chosen = candidates[0]
+
+    val, el, txt = chosen
+    logger.info(f"[{session_id}] Selecting District tier Rs.{val}: {txt}")
+    await _human_click(page, el)
+    await _human_delay(1.0, 1.8)
+    return True
+
+
+async def _district_set_max_qty(page, session_id: str,
+                                max_qty: int = DEFAULT_MAX_QTY):
+    """Increment the quantity selector to the maximum allowed."""
+    # Try the + / plus button repeatedly
+    for _ in range(max_qty):
+        clicked = await _try_click_first(page, [
+            "button[aria-label*='increase' i]",
+            "button[aria-label*='plus' i]",
+            "button:has-text('+')",
+            "[class*='qty'] button:has-text('+')",
+            "[class*='quantity'] button:has-text('+')",
+            "[class*='counter'] button:has-text('+')",
+        ], timeout=700)
+        if not clicked:
+            break
+        await _human_delay(0.1, 0.3)
+
+    # Fallback: direct number input
+    try:
+        inp = page.locator(
+            "input[type='number'], input[name*='qty' i], input[name*='quantity' i]"
+        ).first
+        if await inp.is_visible(timeout=1_500):
+            await inp.fill(str(max_qty))
+            await _human_delay(0.2, 0.5)
+    except Exception:
+        pass
+
+
+async def _run_district_cart(page, session_id: str, target_price: str,
+                             watcher_id: str,
+                             max_qty: int = DEFAULT_MAX_QTY) -> str:
+    """
+    District.in cart flow:
+      1. Detect & wait through queue/waiting-room (up to 10 min)
+      2. Pick cheapest tier (or target price)
+      3. Bump quantity to max
+      4. Click Add to Cart / Proceed
+      5. Capture URL
+    """
+    _update(session_id, message="On District — checking for queue...")
+
+    # Step 1: queue handling
+    await _district_wait_through_queue(page, session_id)
+
+    # Give the ticket UI a moment to fully render
+    await _human_delay(1.0, 2.0)
+    try:
+        await page.wait_for_load_state("networkidle", timeout=8_000)
+    except Exception:
+        pass
+
+    # Step 2: pick cheapest tier
+    await _district_pick_cheapest_tier(page, session_id, target_price)
+
+    # Step 3: set max quantity
+    await _district_set_max_qty(page, session_id, max_qty)
+
+    # Step 4: proceed to cart
+    _update(session_id, message="Adding District tickets to cart...")
     await _try_click_first(page, [
+        "button:has-text('Add to Cart')",
         "button:has-text('Proceed')",
         "button:has-text('Continue')",
-        "button:has-text('Add to Cart')",
         "button:has-text('Checkout')",
+        "button:has-text('Book Now')",
         "button[type='submit']",
     ], timeout=5_000)
     await _human_delay(1.5, 3.0)
@@ -901,12 +1048,12 @@ async def _run_district_cart(page, session_id: str, target_price: str,
         pass
 
     url = page.url
-    logger.info(f"[{session_id}] District URL: {url}")
+    logger.info(f"[{session_id}] District cart URL: {url}")
     return url
 
 
 # ═════════════════════════════════════════════════════════════════════════════
-# §10  URL DERIVATION (fallback when no proxy is available)
+# §9  URL DERIVATION (fallback when no proxy is available)
 # ═════════════════════════════════════════════════════════════════════════════
 
 def _derive_buytickets_url(event_url: str) -> str:
@@ -926,15 +1073,15 @@ def _derive_buytickets_url(event_url: str) -> str:
 
 
 # ═════════════════════════════════════════════════════════════════════════════
-# §11  MAIN CHECKOUT COROUTINE
+# §10  MAIN CART COROUTINE
 # ═════════════════════════════════════════════════════════════════════════════
 
-async def _run_checkout(session_id: str, checkout_url: str, card: dict,
-                        cart_mode: bool = True, target_price: str = "",
-                        watcher_id: str = ""):
+async def _run_cart(session_id: str, checkout_url: str, target_price: str,
+                    watcher_id: str, max_qty: int = DEFAULT_MAX_QTY):
     """
-    Core booking coroutine — runs inside the worker thread's event loop.
-    Opens stealth Chromium via residential proxy, performs full booking flow.
+    Core cart coroutine — runs inside the worker thread's event loop.
+    Opens stealth Chromium via residential proxy, adds cheapest tier + max
+    seats to cart, returns the cart/checkout URL. Never touches payment.
     """
     try:
         from playwright.async_api import async_playwright
@@ -952,8 +1099,8 @@ async def _run_checkout(session_id: str, checkout_url: str, card: dict,
     except Exception as e:
         logger.warning(f"[{session_id}] playwright-stealth not available ({e}) — using manual JS patches")
 
-    mode_label = "cart" if cart_mode else "full-checkout"
-    _update(session_id, status="running", message=f"Starting {mode_label}...")
+    _update(session_id, status="running",
+            message="Starting cart session — cheapest tier + max seats...")
 
     ua = random.choice(USER_AGENTS)
     vp = random.choice(VIEWPORTS)
@@ -971,7 +1118,6 @@ async def _run_checkout(session_id: str, checkout_url: str, card: dict,
             ],
         )
 
-        # Single persistent BrowserContext — all cookies/tokens preserved
         ctx_kwargs = {
             "user_agent":        ua,
             "viewport":          vp,
@@ -1043,158 +1189,49 @@ async def _run_checkout(session_id: str, checkout_url: str, card: dict,
             is_bms      = "bookmyshow.com" in checkout_url.lower()
             is_district = "district.in" in checkout_url.lower()
 
-            # ── Cart mode ────────────────────────────────────────────────
-            if cart_mode:
-                if is_bms:
-                    cart_url = await _run_bms_cart(
-                        page, session_id, target_price, watcher_id
-                    )
-                elif is_district:
-                    cart_url = await _run_district_cart(
-                        page, session_id, target_price, watcher_id
-                    )
-                else:
-                    cart_url = page.url
-
-                _update(session_id, status="cart_ready",
-                        message="Cart ready — open the link and pay!",
-                        cart_url=cart_url)
-                logger.info(f"[{session_id}] Cart URL: {cart_url}")
-
-                # Validate: if cart_url is just the homepage, derive a proper one
-                if cart_url:
-                    from urllib.parse import urlparse
-                    parsed = urlparse(cart_url)
-                    if not parsed.path or parsed.path.rstrip('/') == '':
-                        better_url = _derive_buytickets_url(checkout_url)
-                        logger.warning(
-                            f"[{session_id}] cart_url was homepage ({cart_url}) "
-                            f"— replaced with {better_url}"
-                        )
-                        cart_url = better_url
-                        _update(session_id, cart_url=cart_url)
-
-                if watcher_id:
-                    _notify_cart_ready(watcher_id, cart_url)
-                return
-
-            # ── Full checkout ────────────────────────────────────────────
-            profile = _profile()
+            # ── Cart flow ────────────────────────────────────────────────
             if is_bms:
-                await _run_bms_cart(page, session_id, target_price, watcher_id)
+                cart_url = await _run_bms_cart(
+                    page, session_id, target_price, watcher_id, max_qty
+                )
             elif is_district:
-                await _run_district_cart(page, session_id, target_price, watcher_id)
-
-            _update(session_id, message="Filling personal details...")
-            await _human_fill(page, "input[name*='name' i], input[placeholder*='name' i]", profile["name"])
-            await _human_fill(page, "input[type='email'], input[name*='email' i]", profile["email"])
-            await _human_fill(page, "input[type='tel'], input[name*='phone' i]", profile["phone"])
-
-            _update(session_id, message=f"Filling card #{card['priority']}...")
-            await _human_fill(page, "input[name*='card'][name*='number' i], input[placeholder*='card number' i]", card["number"])
-            await _human_fill(page, "input[name*='expiry' i], input[placeholder*='MM/YY' i]", card["expiry"])
-            await _human_fill(page, "input[name*='cvv' i], input[placeholder*='CVV' i]", card["cvv"])
-
-            for iframe_sel in ["iframe[src*='razorpay']", "iframe[src*='stripe']",
-                               "iframe[name*='card']", "iframe[title*='payment' i]"]:
-                try:
-                    await page.wait_for_selector(iframe_sel, timeout=3_000)
-                    f = page.frame_locator(iframe_sel)
-                    await _human_fill(f, "input[name*='number' i], input[placeholder*='Card' i]", card["number"])
-                    await _human_fill(f, "input[name*='expiry' i], input[placeholder*='MM' i]", card["expiry"])
-                    await _human_fill(f, "input[name*='cvv' i], input[placeholder*='CVV' i]", card["cvv"])
-                    break
-                except Exception:
-                    pass
-
-            await _try_click_first(page, [
-                "button:has-text('Pay Now')", "button:has-text('Confirm')",
-                "button:has-text('Place Order')", "button[class*='pay' i]",
-                "button[type='submit']",
-            ])
-            await _human_delay(1.5, 3.0)
-            try:
-                await page.wait_for_load_state("domcontentloaded", timeout=15_000)
-            except Exception:
-                pass
-
-            # ── OTP gate ─────────────────────────────────────────────────
-            is_otp = any(p in page.url.lower() for p in ["otp", "verify", "2fa", "confirm"])
-            if not is_otp:
-                for sel in OTP_SCREEN_SELECTORS:
-                    try:
-                        if await page.locator(sel).first.is_visible(timeout=1_500):
-                            is_otp = True
-                            break
-                    except Exception:
-                        pass
-
-            if is_otp:
-                logger.info(f"[{session_id}] OTP screen detected")
-                _update(session_id, status="otp_required",
-                        message=f"Card #{card['priority']} — enter OTP")
-
-                otp = await _wait_for_otp(session_id, timeout_s=OTP_TIMEOUT_S)
-                if not otp:
-                    raise TimeoutError("OTP not received within 5 minutes")
-
-                _update(session_id, message="Submitting OTP...")
-                for sel in OTP_SCREEN_SELECTORS:
-                    try:
-                        loc = page.locator(sel).first
-                        if await loc.is_visible(timeout=2_000):
-                            await loc.fill(otp)
-                            await _human_delay(0.3, 0.7)
-                            break
-                    except Exception:
-                        pass
-
-                await _try_click_first(page, [
-                    "button:has-text('Submit')", "button:has-text('Verify')",
-                    "button:has-text('Confirm')", "button[type='submit']",
-                ])
-                await _human_delay(2.0, 4.0)
-                try:
-                    await page.wait_for_load_state("networkidle", timeout=15_000)
-                except Exception:
-                    pass
-
-            # ── Outcome ──────────────────────────────────────────────────
-            body = (await page.text_content("body") or "").lower()
-            url  = page.url.lower()
-
-            if any(p in url or p in body for p in SUCCESS_PATTERNS):
-                _update(session_id, status="success",
-                        message=f"Card #{card['priority']} — Booking confirmed!")
-                logger.info(f"[{session_id}] CONFIRMED")
+                cart_url = await _run_district_cart(
+                    page, session_id, target_price, watcher_id, max_qty
+                )
             else:
-                reason = next((p for p in FAILURE_PATTERNS if p in body), "unknown")
-                _update(session_id, status="failed",
-                        message=f"Card #{card['priority']} failed ({reason})")
-                logger.warning(f"[{session_id}] Failed — {reason}")
+                cart_url = page.url
+
+            # Validate: if cart_url is just the homepage, derive a proper one
+            if cart_url:
+                from urllib.parse import urlparse
+                parsed = urlparse(cart_url)
+                if not parsed.path or parsed.path.rstrip('/') == '':
+                    better_url = _derive_buytickets_url(checkout_url)
+                    logger.warning(
+                        f"[{session_id}] cart_url was homepage ({cart_url}) "
+                        f"— replaced with {better_url}"
+                    )
+                    cart_url = better_url
+
+            _update(session_id, status="cart_ready",
+                    message="Cart ready — open the link and pay!",
+                    cart_url=cart_url)
+            logger.info(f"[{session_id}] Cart URL: {cart_url}")
+
+            if watcher_id:
+                _notify_cart_ready(watcher_id, cart_url)
+            return
 
         except Exception as e:
-            logger.error(f"[{session_id}] Checkout error: {e}")
+            logger.error(f"[{session_id}] Cart error: {e}")
             _update(session_id, status="failed", message=str(e)[:200])
         finally:
             await ctx.close()
             await browser.close()
 
 
-async def _wait_for_otp(session_id: str, timeout_s: int = OTP_TIMEOUT_S) -> Optional[str]:
-    """Poll session dict for OTP injected by user."""
-    deadline = time.time() + timeout_s
-    while time.time() < deadline:
-        with _sessions_lock:
-            otp = _sessions.get(session_id, {}).get("otp")
-        if otp:
-            return otp
-        await asyncio.sleep(2)
-    return None
-
-
 # ═════════════════════════════════════════════════════════════════════════════
-# §12  CART NOTIFICATION
+# §11  CART NOTIFICATION
 # ═════════════════════════════════════════════════════════════════════════════
 
 def _notify_cart_ready(watcher_id: str, cart_url: str):
@@ -1216,7 +1253,7 @@ def _notify_cart_ready(watcher_id: str, cart_url: str):
 
 
 # ═════════════════════════════════════════════════════════════════════════════
-# §13  BACKGROUND WORKER THREAD
+# §12  BACKGROUND WORKER THREAD
 # ═════════════════════════════════════════════════════════════════════════════
 
 _worker_thread: Optional[threading.Thread] = None
@@ -1228,7 +1265,7 @@ def _worker_main():
     loop = asyncio.new_event_loop()
     asyncio.set_event_loop(loop)
     _worker_started.set()
-    logger.info("Booking worker thread started (dedicated asyncio loop)")
+    logger.info("Cart worker thread started (dedicated asyncio loop)")
 
     while True:
         try:
@@ -1239,66 +1276,35 @@ def _worker_main():
 
             logger.info(
                 f"Worker processing: watcher={job.watcher_id} "
-                f"url={job.checkout_url[:80]} cart_mode={job.cart_mode}"
+                f"url={job.checkout_url[:80]} target={job.target_price} "
+                f"max_qty={job.max_qty}"
             )
 
-            pool = _load_card_pool()
+            sid = _session_id(job.watcher_id)
+            has_proxy = all([PROXY_SERVER, PROXY_USERNAME, PROXY_PASSWORD])
 
-            if job.cart_mode:
-                sid = _session_id(job.watcher_id, 1)
-                has_proxy = all([PROXY_SERVER, PROXY_USERNAME, PROXY_PASSWORD])
-
-                if has_proxy:
-                    # Full Playwright flow with stealth + proxy
-                    card = pool[0] if pool else {"priority": 1}
-                    loop.run_until_complete(
-                        _run_checkout(
-                            sid, job.checkout_url, card,
-                            cart_mode=True,
-                            target_price=job.target_price,
-                            watcher_id=job.watcher_id,
-                        )
+            if has_proxy:
+                # Full Playwright cart flow with stealth + proxy
+                loop.run_until_complete(
+                    _run_cart(
+                        sid, job.checkout_url,
+                        target_price=job.target_price,
+                        watcher_id=job.watcher_id,
+                        max_qty=job.max_qty,
                     )
-                else:
-                    # No proxy → instant URL derivation fallback
-                    cart_url = _derive_buytickets_url(job.checkout_url)
-                    logger.info(
-                        f"[{sid}] No proxy — instant URL: {cart_url}"
-                    )
-                    with _sessions_lock:
+                )
+            else:
+                # No proxy → instant URL derivation fallback
+                cart_url = _derive_buytickets_url(job.checkout_url)
+                logger.info(f"[{sid}] No proxy — instant URL: {cart_url}")
+                with _sessions_lock:
+                    if sid in _sessions:
                         _sessions[sid].update({
                             "status":   "cart_ready",
                             "message":  "Booking link ready — open and select seats!",
                             "cart_url": cart_url,
                         })
-                    _notify_cart_ready(job.watcher_id, cart_url)
-
-            else:
-                if not pool:
-                    logger.warning("No cards configured for full checkout")
-                    continue
-
-                for card in pool:
-                    sid = _session_id(job.watcher_id, card["priority"])
-                    with _sessions_lock:
-                        existing = _sessions.get(sid, {}).get("status")
-                        if existing in ("running", "otp_required", "cart_ready"):
-                            continue
-                        _sessions[sid] = {
-                            "status": "running", "message": "Starting...",
-                            "otp": None, "device_id": None,
-                            "card_priority": card["priority"],
-                            "cart_url": None, "cart_mode": False,
-                            "created_at": time.time(),
-                        }
-                    loop.run_until_complete(
-                        _run_checkout(
-                            sid, job.checkout_url, card,
-                            cart_mode=False,
-                            target_price=job.target_price,
-                            watcher_id=job.watcher_id,
-                        )
-                    )
+                _notify_cart_ready(job.watcher_id, cart_url)
 
             _job_queue.task_done()
 
@@ -1307,59 +1313,65 @@ def _worker_main():
 
 
 def start_worker():
-    """Start the background booking worker thread (called from gunicorn post_fork)."""
+    """Start the background cart worker thread (called from gunicorn post_fork)."""
     global _worker_thread
     if _worker_thread and _worker_thread.is_alive():
         return
     _worker_thread = threading.Thread(
-        target=_worker_main, daemon=True, name="booking-worker"
+        target=_worker_main, daemon=True, name="cart-worker"
     )
     _worker_thread.start()
     _worker_started.wait(timeout=5)
-    logger.info("Booking worker thread is ready")
+    logger.info("Cart worker thread is ready")
 
 
 # ═════════════════════════════════════════════════════════════════════════════
-# §14  PUBLIC ENTRY POINT — Called by Flask
+# §13  PUBLIC ENTRY POINT — Called by Flask
 # ═════════════════════════════════════════════════════════════════════════════
 
 def trigger_auto_checkout(watcher_id: str, checkout_url: str,
-                          cart_mode: bool = True,
                           target_price: str = "",
-                          owner_email: str = ""):
+                          max_qty: int = DEFAULT_MAX_QTY,
+                          owner_email: str = "",
+                          **_ignored):
     """
-    Enqueue a booking job for the background worker.
+    Enqueue a cart-add job for the background worker.
 
-    NON-BLOCKING — drops job in queue and returns immediately.
-    The worker thread processes it in its own asyncio loop.
+    Always cart-only: picks the cheapest price tier and max available seats,
+    returns the cart link. NON-BLOCKING.
+
+    Extra keyword arguments are silently ignored for backwards compatibility
+    (e.g. legacy ``cart_mode`` flag).
     """
     _cleanup_stale_sessions()
 
-    sid = _session_id(watcher_id, 1)
+    sid = _session_id(watcher_id)
 
     # Guard against duplicate jobs
     with _sessions_lock:
         existing = _sessions.get(sid, {}).get("status")
-        if existing in ("running", "otp_required", "cart_ready"):
+        if existing in ("running", "queued", "cart_ready"):
             logger.info(f"[{sid}] Already active ({existing}) — skipping")
             return
         # Reserve slot atomically
         _sessions[sid] = {
-            "status": "running", "message": "Queued — waiting for worker...",
-            "otp": None, "device_id": None,
-            "card_priority": 1, "cart_url": None,
-            "cart_mode": cart_mode, "created_at": time.time(),
+            "status":     "running",
+            "message":    "Queued — waiting for worker...",
+            "cart_url":   None,
+            "created_at": time.time(),
         }
 
     job = BookingJob(
-        watcher_id=watcher_id, checkout_url=checkout_url,
-        cart_mode=cart_mode, target_price=target_price,
+        watcher_id=watcher_id,
+        checkout_url=checkout_url,
+        target_price=target_price,
+        max_qty=max_qty,
         owner_email=owner_email,
     )
 
     try:
         _job_queue.put_nowait(job)
-        logger.info(f"[{sid}] Job enqueued (cart_mode={cart_mode})")
+        logger.info(f"[{sid}] Cart job enqueued (target={target_price}, max_qty={max_qty})")
     except queue.Full:
         logger.error(f"[{sid}] Job queue full — dropping")
         _update(sid, status="failed", message="Server busy — try again")

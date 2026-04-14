@@ -27,15 +27,13 @@ load_dotenv(ROOT_DIR / ".env")
 
 try:
     from .scraper import check_url_availability
-    from .autocheckout import (trigger_auto_checkout, claim_slot,
-                                get_session, get_session_for_device, inject_otp,
-                                start_worker)
+    from .autocheckout import (trigger_auto_checkout, get_session,
+                                get_watcher_session, start_worker)
     from .auth import auth_bp, current_user, require_login, user_id
 except ImportError:
     from scraper import check_url_availability
-    from autocheckout import (trigger_auto_checkout, claim_slot,
-                               get_session, get_session_for_device, inject_otp,
-                               start_worker)
+    from autocheckout import (trigger_auto_checkout, get_session,
+                               get_watcher_session, start_worker)
     from auth import auth_bp, current_user, require_login, user_id
 
 logging.basicConfig(
@@ -354,7 +352,7 @@ def notify_all(watcher, status):
         payload = {
             "type": "AVAILABLE",
             "title": "🎫 TICKETS AVAILABLE!",
-            "body": f"{watcher['name']} — Open checkout now and complete OTP manually.",
+            "body": f"{watcher['name']} — Cart is ready. Open the link and complete payment.",
             "url": target_url,
             "watcher_id": watcher["id"],
             "alarm": True,
@@ -396,8 +394,8 @@ def notify_all(watcher, status):
         checkout_url = watcher.get("checkout_url") or _derive_checkout_url(watcher["url"])
         trigger_auto_checkout(
             watcher["id"], checkout_url,
-            cart_mode=watcher.get("cart_mode", True),
             target_price=watcher.get("target_price", ""),
+            max_qty=int(watcher.get("max_qty", 10) or 10),
             owner_email=watcher.get("owner", ""),
         )
 
@@ -586,7 +584,11 @@ def add_watcher():
                 break
 
         target_price = body.get("target_price", "").strip()   # e.g. "1500" or "₹1500"
-        cart_mode    = bool(body.get("cart_mode", True))       # default: add-to-cart only
+        try:
+            max_qty = int(body.get("max_qty", 10) or 10)
+        except (TypeError, ValueError):
+            max_qty = 10
+        max_qty = max(1, min(max_qty, 20))
 
         watcher = {
             "id": str(uuid.uuid4())[:8],
@@ -600,7 +602,7 @@ def add_watcher():
             "last_checked_ts": 0,
             "price": "",
             "target_price": target_price,
-            "cart_mode": cart_mode,
+            "max_qty": max_qty,
             "cart_url": None,
             "paused": False,
             "done": False,
@@ -810,41 +812,21 @@ def service_worker():
 def manifest():
     return send_from_directory(app.static_folder, "manifest.json")
 
-@app.route("/api/claim-slot", methods=["POST"])
-def api_claim_slot():
+@app.route("/api/cart-status/<watcher_id>")
+def cart_status(watcher_id):
     """
-    A device calls this to claim the next available checkout slot (card).
-    Returns { session_id, card_priority } or { session_id: null } if none free.
+    Frontend polls this to track cart progress for a watcher.
+    Returns { status, message, cart_url, session_id }.
     """
-    body       = request.json or {}
-    watcher_id = body.get("watcher_id", "").strip()
-    device_id  = body.get("device_id",  "").strip()
-    if not watcher_id or not device_id:
-        return jsonify({"error": "watcher_id and device_id are required"}), 400
-    session_id = claim_slot(watcher_id, device_id)
-    if session_id:
-        sess = get_session(session_id)
-        return jsonify({"session_id": session_id,
-                        "card_priority": sess.get("card_priority", 0)})
-    return jsonify({"session_id": None})
+    if not _validate_watcher_id(watcher_id):
+        return jsonify({"error": "Invalid watcher ID"}), 400
+    return jsonify(get_watcher_session(watcher_id))
 
 
 @app.route("/api/checkout-status/<session_id>")
 def checkout_status(session_id):
-    """Frontend polls this with its session_id to track checkout progress."""
+    """Legacy alias — frontend polls session_id directly."""
     return jsonify(get_session(session_id))
-
-
-@app.route("/api/submit-otp", methods=["POST"])
-def submit_otp():
-    """Receives OTP from the user and delivers it to the correct session."""
-    body       = request.json or {}
-    session_id = body.get("session_id", "").strip()
-    otp        = body.get("otp",        "").strip()
-    if not session_id or not otp:
-        return jsonify({"error": "session_id and otp are required"}), 400
-    inject_otp(session_id, otp)
-    return jsonify({"ok": True})
 
 
 if __name__ == "__main__":
