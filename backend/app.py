@@ -428,7 +428,7 @@ def notify_all(watcher, status):
 
 _monitor_thread = None
 _stop_event = threading.Event()
-_data_lock = threading.Lock()
+_data_lock = threading.RLock()  # RLock: re-entrant so check_now→notify_all won't deadlock
 
 USE_BROWSER = os.environ.get("USE_BROWSER", "false").lower() == "true"
 MIN_CHECK_INTERVAL_SECONDS = max(3, int(os.environ.get("MIN_CHECK_INTERVAL_SECONDS", "5")))
@@ -524,9 +524,17 @@ def subscribe():
     sub_info["owner"] = user_id()   # tag subscription with logged-in Gmail
     with _data_lock:
         data = load_data()
-        if not any(s.get("endpoint") == sub_info.get("endpoint") for s in data["subscriptions"]):
+        # UPSERT: update owner if endpoint already exists (critical for post-login re-sync)
+        existing = next((s for s in data["subscriptions"]
+                         if s.get("endpoint") == sub_info.get("endpoint")), None)
+        if existing:
+            # Update owner + keys (they can rotate)
+            existing.update(sub_info)
+            logger.info(f"Subscription updated for owner={sub_info.get('owner')}")
+        else:
             data["subscriptions"].append(sub_info)
-            save_data(data)
+            logger.info(f"Subscription added for owner={sub_info.get('owner')}")
+        save_data(data)
     return jsonify({"ok": True, "count": len(data["subscriptions"])})
 
 @app.route("/api/unsubscribe", methods=["POST"])
