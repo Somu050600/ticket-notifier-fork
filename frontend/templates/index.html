@@ -754,11 +754,65 @@
       <div style="font-size:11px; color:#ffcc00; margin-top:4px; text-align:center; font-weight:600;">
         ⚡ Opens seat selection directly - be fast!
       </div>
+
+      <!-- Session hijack — transfer the bot's cookies to your browser -->
+      <div id="session-transfer" style="margin-top:10px; padding:10px; border-radius:8px;
+           background:rgba(255,255,255,.06); border:1px solid rgba(255,204,0,.35);">
+        <div style="font-size:12px; color:#ffe680; font-weight:700; margin-bottom:6px;">
+          🔑 Getting kicked back to /cinemas?
+        </div>
+        <div style="font-size:11px; color:#ffe6a8; line-height:1.4; margin-bottom:8px;">
+          The bot holds the session that owns your cart. Transfer it to your browser:
+        </div>
+        <div style="display:flex; gap:8px; flex-wrap:wrap;">
+          <button class="alert-btn secondary" onclick="copyCartCookies()"
+                  style="flex:1; min-width:140px;">
+            📋 Copy Session
+          </button>
+          <button class="alert-btn secondary" onclick="showCookieInstructions()"
+                  style="flex:1; min-width:140px;">
+            ❓ How to Use
+          </button>
+        </div>
+        <div id="cookie-status" style="font-size:11px; color:#aaffcc;
+             margin-top:6px; text-align:center;"></div>
+      </div>
     </div>
 
     <div class="alert-actions">
       <button class="alert-btn primary" id="alert-open-btn">Open Page</button>
       <button class="alert-btn secondary" onclick="closeAlert()">Dismiss</button>
+    </div>
+  </div>
+
+  <!-- Cookie instructions modal -->
+  <div id="cookie-modal" style="display:none; position:fixed; inset:0; z-index:99;
+       background:rgba(0,0,0,.85); align-items:center; justify-content:center; padding:20px;">
+    <div style="max-width:560px; width:100%; max-height:90vh; overflow:auto;
+         background:#1a1a2e; border-radius:14px; padding:22px; color:#fff;
+         box-shadow:0 20px 60px rgba(0,0,0,.6);">
+      <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:14px;">
+        <h3 style="margin:0; font-size:18px;">🔑 Transfer Bot Session to Your Browser</h3>
+        <button onclick="hideCookieInstructions()"
+                style="background:none; border:none; color:#fff; font-size:22px;
+                       cursor:pointer; padding:0 6px;">×</button>
+      </div>
+      <ol style="font-size:13px; line-height:1.6; padding-left:18px; color:#ddd;">
+        <li>Install <a href="https://chromewebstore.google.com/detail/cookie-editor/hlkenndednhfkekhgcdicdfddnkalmdm"
+               target="_blank" style="color:#a855f7;">Cookie-Editor</a>
+               (Chrome/Edge/Firefox) or <a
+               href="https://chromewebstore.google.com/detail/editthiscookie/fngmhnnpilhplaeedifhccceomclgfbg"
+               target="_blank" style="color:#a855f7;">EditThisCookie</a>.</li>
+        <li>Tap <b>📋 Copy Session</b> in the alert above — this copies the bot's wristband to your clipboard.</li>
+        <li>Open the cart link in a new tab (it'll bounce you to /cinemas — that's fine).</li>
+        <li>Click the Cookie-Editor icon → <b>Import</b> → paste → <b>Save</b>.</li>
+        <li>Refresh the page. You now hold the bot's session — go straight to checkout.</li>
+      </ol>
+      <div style="font-size:11px; color:#888; margin-top:14px; padding-top:12px;
+           border-top:1px solid #333;">
+        Cookies expire quickly, so paste and pay fast. If the page still bounces,
+        tap Copy Session again — the bot may have updated the wristband.
+      </div>
     </div>
   </div>
 
@@ -1322,12 +1376,81 @@
     _sessionId = null;
     _currentCartUrl = null;
     _fallbackOpenUrl = null;
+    const fb = document.getElementById('cookie-fallback-box');
+    if (fb) fb.remove();
+    const cs = document.getElementById('cookie-status');
+    if (cs) cs.textContent = '';
+  }
+
+  // Track which watcher's cookies we can copy (set when cart_ready fires)
+  let _cookieWatcherId = null;
+
+  // ── Cookie transfer helpers ────────────────────────────────────────────────
+  async function copyCartCookies() {
+    const statusEl = document.getElementById('cookie-status');
+    if (!_cookieWatcherId) {
+      statusEl.textContent = 'Cart session not ready yet — wait a moment.';
+      return;
+    }
+    statusEl.textContent = 'Fetching session…';
+    try {
+      const res = await fetch(`/api/watchers/${_cookieWatcherId}/cookies`);
+      if (!res.ok) {
+        statusEl.textContent = `Failed (${res.status}). Try again in a few seconds.`;
+        return;
+      }
+      const data = await res.json();
+      const cookies = data.editthiscookie || [];
+      if (!cookies.length) {
+        statusEl.textContent = 'No session cookies captured yet.';
+        return;
+      }
+      const json = JSON.stringify(cookies, null, 2);
+      try {
+        await navigator.clipboard.writeText(json);
+        statusEl.innerHTML = `✅ Copied ${cookies.length} cookies. Now paste in Cookie-Editor → Import.`;
+      } catch (e) {
+        // Clipboard blocked — show a textarea fallback
+        showCookieTextareaFallback(json, cookies.length);
+        statusEl.textContent = 'Clipboard blocked — copy from the box below.';
+      }
+    } catch (e) {
+      statusEl.textContent = 'Network error — try again.';
+    }
+  }
+
+  function showCookieTextareaFallback(json, count) {
+    let existing = document.getElementById('cookie-fallback-box');
+    if (existing) existing.remove();
+    const wrap = document.createElement('div');
+    wrap.id = 'cookie-fallback-box';
+    wrap.style.marginTop = '8px';
+    wrap.innerHTML = `
+      <textarea readonly style="width:100%; height:120px; font-family:monospace;
+               font-size:10px; padding:6px; border-radius:6px; border:1px solid #555;
+               background:#0a0a18; color:#aaffcc; box-sizing:border-box;">${
+        json.replace(/</g,'&lt;')
+      }</textarea>
+      <div style="font-size:10px; color:#aaa; margin-top:4px;">
+        ${count} cookies — select all, copy, then paste in Cookie-Editor → Import.
+      </div>`;
+    document.getElementById('session-transfer').appendChild(wrap);
+    const ta = wrap.querySelector('textarea');
+    ta.focus(); ta.select();
+  }
+
+  function showCookieInstructions() {
+    document.getElementById('cookie-modal').style.display = 'flex';
+  }
+  function hideCookieInstructions() {
+    document.getElementById('cookie-modal').style.display = 'none';
   }
 
   // Poll /api/cart-status/<watcher_id> every 2 s — cart-only mode
   function _startCartPoll(watcherId) {
     if (_otpPollTimer) clearInterval(_otpPollTimer);
     _sessionId = `${watcherId}-cart`;
+    _cookieWatcherId = watcherId;
     updateAlertOpenButton(null, { enabled: false, label: 'Preparing Cart...' });
     document.getElementById('alert-body').textContent =
       '🤖 Picking cheapest tier and max seats — standby…';

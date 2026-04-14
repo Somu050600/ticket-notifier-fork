@@ -444,20 +444,30 @@ def apply_check_result(watcher, result):
     if result.get("name") and watcher.get("name") in ("", "Checking\u2026", "Checking...", None):
         watcher["name"] = result["name"]
 
+    # CRITICAL: never let "unknown"/"error" results overwrite a known status
+    # or trigger alerts. A fetch failure is NOT availability.
+    if status in ("unknown", "error"):
+        watcher.update({
+            "last_checked_ts": time.time(),
+            "last_checked":    datetime.now().isoformat(),
+        })
+        # Keep last_status as-is (don't flip from available→unknown on a
+        # transient network blip). No alert.
+        return watcher
+
     watcher.update({
-        "last_status": status,
+        "last_status":    status,
         "last_checked_ts": time.time(),
-        "last_checked": datetime.now().isoformat(),
+        "last_checked":   datetime.now().isoformat(),
     })
     if result.get("price"):
         watcher["price"] = result["price"]
 
-    # Alert once when transitioning into "available" or "upcoming".
-    # Set alerted_at BEFORE calling notify_all to prevent double-fire
-    # on rapid consecutive checks.
+    # Alert ONLY on a real transition into "available"/"upcoming".
+    # We no longer auto-re-fire when alerted_at is missing — that caused
+    # the false-positive alert storm when the scraper mis-reported.
     alert_needed = (
-        (status != prev_status and status in ("available", "upcoming"))
-        or (status == "available" and not watcher.get("alerted_at"))
+        status != prev_status and status in ("available", "upcoming")
     )
     if alert_needed:
         if status == "available":
@@ -766,14 +776,15 @@ def _is_valid_cart_url(cart_url: str) -> bool:
     return True
 
 
-def _store_cart_url(watcher_id: str, cart_url: str) -> bool:
+def _store_cart_url(watcher_id: str, cart_url: str, cookies=None) -> bool:
     """
-    Internal helper — update the watcher's cart_url and fire notifications.
-    Called both by the HTTP endpoint AND directly by the worker thread.
-    Returns True if successful, False if watcher not found.
+    Internal helper — update the watcher's cart_url + cart_cookies and fire
+    notifications. Called both by the HTTP endpoint AND directly by the worker
+    thread. Returns True if successful, False if watcher not found.
+
+    ``cookies`` is the dict captured by autocheckout:
+      { "raw": [...], "editthiscookie": [...], "ok": bool }
     """
-    # If the URL is junk/missing, we'll derive a fallback from the event URL
-    # (done inside the lock once we have the watcher).
     with _data_lock:
         data = load_data()
         watcher = next((w for w in data["watchers"] if w["id"] == watcher_id), None)
@@ -793,6 +804,11 @@ def _store_cart_url(watcher_id: str, cart_url: str) -> bool:
             cart_url = derived
 
         watcher["cart_url"] = cart_url
+        if cookies is not None and isinstance(cookies, dict):
+            # Store cookies so frontend can pull them. Don't leak secrets to
+            # /api/watchers listing — served only via dedicated endpoint.
+            watcher["cart_cookies"] = cookies
+            watcher["cart_cookies_ts"] = time.time()
         save_data(data)
 
     # Fire notifications OUTSIDE the lock to avoid holding it during I/O
@@ -805,11 +821,40 @@ def update_cart_url(watcher_id):
     """Internal — called by autocheckout to store the captured cart URL."""
     if not _validate_watcher_id(watcher_id):
         return jsonify({"error": "Invalid watcher ID"}), 400
-    cart_url = (request.json or {}).get("cart_url", "")
-    ok = _store_cart_url(watcher_id, cart_url)
+    body = request.json or {}
+    cart_url = body.get("cart_url", "")
+    cookies = body.get("cookies")
+    ok = _store_cart_url(watcher_id, cart_url, cookies)
     if ok:
         return jsonify({"ok": True})
     return jsonify({"error": "Not found"}), 404
+
+
+@app.route("/api/watchers/<watcher_id>/cookies", methods=["GET"])
+def get_watcher_cookies(watcher_id):
+    """
+    Return the captured session cookies in Cookie-Editor-compatible JSON.
+    The user pastes this into the Cookie-Editor extension on the target
+    domain (bookmyshow.com / district.in), refreshes, and lands on the
+    cart page directly — bypassing the redirect-to-/cinemas bounce.
+    """
+    if not _validate_watcher_id(watcher_id):
+        return jsonify({"error": "Invalid watcher ID"}), 400
+    with _data_lock:
+        data = load_data()
+        watcher = next((w for w in data["watchers"] if w["id"] == watcher_id), None)
+    if not watcher:
+        return jsonify({"error": "Not found"}), 404
+    if not _owns_watcher(watcher):
+        return jsonify({"error": "Not authorized"}), 403
+    cookies = watcher.get("cart_cookies") or {}
+    return jsonify({
+        "editthiscookie": cookies.get("editthiscookie", []),
+        "raw":            cookies.get("raw", []),
+        "cart_url":       watcher.get("cart_url") or "",
+        "ok":             bool(cookies.get("ok")),
+        "ts":             watcher.get("cart_cookies_ts"),
+    })
 
 
 def _send_cart_notification(watcher, cart_url):

@@ -1373,23 +1373,34 @@ async def _run_cart(session_id: str, checkout_url: str, target_price: str,
                 )
                 cart_url = better_url
 
-            # --- NEW: Extract and print cookies to Railway Logs ---
-            # --- NEW: Extract and print cookies to Railway Logs ---
-            import json
-            cookies = await ctx.cookies()
-            logger.info("==================================================")
-            logger.info("🎟️ YOUR SESSION COOKIES (PASTE IN EDITTHISCOOKIE): 🎟️")
-            logger.info(json.dumps(cookies))
-            logger.info("==================================================")
-            # ------------------------------------------------------
+            # ── Extract session cookies (the "VIP wristband") ─────────────
+            # So the user can paste them into Cookie-Editor and resume the
+            # bot's session directly — bypassing the redirect-to-/cinemas
+            # problem where the website kicks the user out for lacking the
+            # session token the bot holds.
+            cookie_payload = {"raw": [], "editthiscookie": [], "ok": False}
+            try:
+                raw_cookies = await ctx.cookies()
+                cookie_payload["raw"] = raw_cookies
+                cookie_payload["editthiscookie"] = _to_editthiscookie_format(
+                    raw_cookies
+                )
+                cookie_payload["ok"] = len(raw_cookies) > 0
+                logger.info(
+                    f"[{session_id}] Captured {len(raw_cookies)} cookies "
+                    f"(VIP wristband ready for transfer)"
+                )
+            except Exception as e:
+                logger.warning(f"[{session_id}] Cookie capture failed: {e}")
 
             _update(session_id, status="cart_ready",
-                    message="Cart ready — Check Railway logs for cookies!",
-                    cart_url=cart_url)
+                    message="Cart ready — tap Open Cart, or Copy Session to paste in Cookie-Editor.",
+                    cart_url=cart_url,
+                    cart_cookies=cookie_payload)
             logger.info(f"[{session_id}] Cart URL: {cart_url}")
 
             if watcher_id:
-                _notify_cart_ready(watcher_id, cart_url)
+                _notify_cart_ready(watcher_id, cart_url, cookie_payload)
             return
 
         except Exception as e:
@@ -1428,6 +1439,54 @@ _VALID_CART_TOKENS = (
 )
 
 
+def _to_editthiscookie_format(raw_cookies: list) -> list:
+    """
+    Convert Playwright cookie dicts to the schema that EditThisCookie /
+    Cookie-Editor expect. Users can copy this JSON, open Cookie-Editor on
+    the target domain, click 'Import', paste, and refresh — they inherit
+    the bot's session wristband and land on the cart page directly.
+    """
+    out = []
+    for c in raw_cookies or []:
+        try:
+            name = c.get("name") or ""
+            if not name:
+                continue
+            expires = c.get("expires")
+            # Playwright uses -1 / absent for session cookies
+            is_session = expires is None or (isinstance(expires, (int, float)) and expires <= 0)
+            domain = c.get("domain") or ""
+            path = c.get("path") or "/"
+            same_site = (c.get("sameSite") or "unspecified").lower()
+            if same_site == "none":
+                same_site = "no_restriction"
+            elif same_site == "lax":
+                same_site = "lax"
+            elif same_site == "strict":
+                same_site = "strict"
+            else:
+                same_site = "unspecified"
+
+            entry = {
+                "domain":     domain,
+                "hostOnly":   not domain.startswith("."),
+                "httpOnly":   bool(c.get("httpOnly", False)),
+                "name":       name,
+                "path":       path,
+                "sameSite":   same_site,
+                "secure":     bool(c.get("secure", False)),
+                "session":    is_session,
+                "storeId":    "0",
+                "value":      c.get("value") or "",
+            }
+            if not is_session and expires is not None:
+                entry["expirationDate"] = float(expires)
+            out.append(entry)
+        except Exception:
+            continue
+    return out
+
+
 def _is_useful_cart_url(cart_url: str) -> bool:
     """True if cart_url looks like a real seat/cart/checkout URL."""
     if not cart_url or not cart_url.startswith("http"):
@@ -1446,11 +1505,16 @@ def _is_useful_cart_url(cart_url: str) -> bool:
     return True
 
 
-def _notify_cart_ready(watcher_id: str, cart_url: str):
-    """Deliver cart URL to the Flask app. Prefers in-process hook over HTTP."""
+def _notify_cart_ready(watcher_id: str, cart_url: str,
+                       cookies: Optional[dict] = None):
+    """Deliver cart URL + cookies to the Flask app. Prefers in-process hook."""
     if _cart_ready_hook is not None:
         try:
-            ok = _cart_ready_hook(watcher_id, cart_url)
+            try:
+                ok = _cart_ready_hook(watcher_id, cart_url, cookies)
+            except TypeError:
+                # Legacy hook signature without cookies
+                ok = _cart_ready_hook(watcher_id, cart_url)
             if ok:
                 logger.info(f"Cart URL delivered in-process for watcher {watcher_id}")
                 return
@@ -1463,7 +1527,7 @@ def _notify_cart_ready(watcher_id: str, cart_url: str):
         import requests as req
         resp = req.post(
             f"http://127.0.0.1:{port}/api/watchers/{watcher_id}/cart-url",
-            json={"cart_url": cart_url},
+            json={"cart_url": cart_url, "cookies": cookies},
             timeout=10,
         )
         if resp.ok:

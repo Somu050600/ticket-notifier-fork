@@ -293,8 +293,47 @@ def _check_bms_api(url: str, use_proxy: bool = False) -> Optional[dict]:
 # §2  REQUESTS-BASED HTML CHECKER
 # ═════════════════════════════════════════════════════════════════════════════
 
+def _html_was_redirected(html: str, url: str) -> bool:
+    """
+    Return True if the HTML looks like the site bounced us to a generic
+    landing page (homepage / /cinemas / /movies / /explore) instead of
+    serving the event page. Prevents false-positive "available" alerts
+    when BMS silently redirects blocked bots.
+    """
+    if not html:
+        return True
+    lowered = html.lower()
+    # Canonical URL check: if page declares its canonical URL is /cinemas etc.
+    m = re.search(r'<link[^>]+rel=["\']canonical["\'][^>]+href=["\']([^"\']+)["\']',
+                  lowered)
+    if m:
+        canonical = m.group(1)
+        for bad in ("/cinemas", "/movies", "/home", "/explore", "/offers"):
+            # If canonical points to a generic landing page and our URL was
+            # event-specific (/sports, /events, /ET...), it's a redirect.
+            if canonical.rstrip("/").endswith(bad) and any(
+                k in url.lower() for k in ("/sports/", "/events/", "/et0")
+            ):
+                return True
+    # Heuristic: event pages contain an ET-code somewhere in the HTML.
+    # If we expected an ET code and none is present, we likely got bounced.
+    expected_et = re.search(r"(ET\d{6,12})", url)
+    if expected_et and expected_et.group(1).lower() not in lowered:
+        # Be lenient: small HTML (<20KB) with no ET code is a clear bounce.
+        # Larger pages might just have the code in JS-only props.
+        if len(html) < 20_000:
+            return True
+    return False
+
+
 def _parse_html(html: str, url: str) -> dict:
     """Extract availability status from raw HTML."""
+    # Reject redirect/bounce pages to prevent false-positive alerts
+    if _html_was_redirected(html, url):
+        logger.info(f"HTML looks redirected/bounced for {url[:60]} — returning unknown")
+        return {"status": "unknown", "name": "", "price": "",
+                "error": "redirected_to_landing"}
+
     soup = BeautifulSoup(html, "lxml")
 
     for tag in soup(["script", "style", "noscript"]):
@@ -490,6 +529,20 @@ async def _fetch_with_playwright(url: str) -> Optional[str]:
             except PWTimeout:
                 pass
 
+            # ── HUMAN BEHAVIOR — mouse moves before interacting ─────
+            try:
+                await page.mouse.move(
+                    random.randint(100, 400), random.randint(150, 300),
+                    steps=random.randint(8, 15),
+                )
+                await asyncio.sleep(random.uniform(0.3, 0.7))
+                await page.mouse.move(
+                    random.randint(500, 900), random.randint(300, 600),
+                    steps=random.randint(8, 15),
+                )
+            except Exception:
+                pass
+
             # Quick scroll to trigger lazy-loaded content
             try:
                 height = await page.evaluate("document.body.scrollHeight")
@@ -501,6 +554,20 @@ async def _fetch_with_playwright(url: str) -> Optional[str]:
                 pass
 
             await asyncio.sleep(random.uniform(0.3, 0.8))
+
+            # ── DETECT REDIRECT TO LANDING PAGE ─────────────────────
+            # If we navigated to /cinemas /movies /home etc., bail out —
+            # don't report "available" based on generic landing HTML.
+            final_url = page.url.lower()
+            for junk in ("/cinemas", "/movies", "/home", "/explore",
+                         "/offers", "/search"):
+                if final_url.rstrip("/").endswith(junk):
+                    logger.warning(
+                        f"Playwright bounced to landing ({final_url}) — "
+                        f"treating as UNKNOWN, not available"
+                    )
+                    return None
+
             html = await page.content()
             if proxy:
                 _proxy_success()

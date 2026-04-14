@@ -8,3 +8,4 @@ node-client/node_modules/
 _push.bat
 _check.bat
 git_output.log
+check.log
