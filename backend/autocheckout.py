@@ -766,7 +766,6 @@ async def _run_bms_cart(page, session_id: str, target_price: str,
     await _human_delay(0.5, 1.0)
 
     clicked_book = await _try_click_first(page, BMS_BOOK, timeout=4_000)
-    clicked_book = await _try_click_first(page, BMS_BOOK, timeout=4_000)
     if clicked_book:
         logger.info(f"[{session_id}] Clicked Book button")
         try:
@@ -1212,6 +1211,7 @@ async def _run_cart(session_id: str, checkout_url: str, target_price: str,
                     )
                     cart_url = better_url
 
+            # --- NEW: Extract and print cookies to Railway Logs ---
             # --- NEW: Extract and print cookies to Railway Logs ---
             import json
             cookies = await ctx.cookies()
