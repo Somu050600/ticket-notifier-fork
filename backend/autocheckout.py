@@ -766,19 +766,18 @@ async def _run_bms_cart(page, session_id: str, target_price: str,
     await _human_delay(0.5, 1.0)
 
     clicked_book = await _try_click_first(page, BMS_BOOK, timeout=4_000)
+    clicked_book = await _try_click_first(page, BMS_BOOK, timeout=4_000)
     if clicked_book:
         logger.info(f"[{session_id}] Clicked Book button")
-        await _human_delay(2.0, 4.0)
         try:
-            await page.wait_for_load_state("domcontentloaded", timeout=10_000)
+            # FORCE Playwright to wait for the actual checkout page to load
+            await page.wait_for_url("**/*checkout*", timeout=15_000)
+            await page.wait_for_load_state("networkidle", timeout=5_000)
         except Exception:
             pass
 
-    post_url = await _bms_capture_url(page, session_id)
-
-    cart_url = post_url
-    if "ticket-options" in pre_book_url and "ticket-options" not in post_url:
-        cart_url = pre_book_url
+    # Grab the actual final URL
+    cart_url = await _bms_capture_url(page, session_id)
 
     return cart_url
 
@@ -1213,8 +1212,17 @@ async def _run_cart(session_id: str, checkout_url: str, target_price: str,
                     )
                     cart_url = better_url
 
+            # --- NEW: Extract and print cookies to Railway Logs ---
+            import json
+            cookies = await ctx.cookies()
+            logger.info("==================================================")
+            logger.info("🎟️ YOUR SESSION COOKIES (PASTE IN EDITTHISCOOKIE): 🎟️")
+            logger.info(json.dumps(cookies))
+            logger.info("==================================================")
+            # ------------------------------------------------------
+
             _update(session_id, status="cart_ready",
-                    message="Cart ready — open the link and pay!",
+                    message="Cart ready — Check Railway logs for cookies!",
                     cart_url=cart_url)
             logger.info(f"[{session_id}] Cart URL: {cart_url}")
 
