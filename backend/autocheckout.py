@@ -389,9 +389,13 @@ async def _bms_handle_popups(page, session_id: str):
         "button:has-text('Accept')",
         "button:has-text('Got It')",
         "button:has-text('OK')",
+        "button:has-text('Close')",
+        "button:has-text('Proceed')",
         "[class*='cookie'] button",
         "[class*='consent'] button",
-        "[class*='close-btn']",
+        "[class*='close']",
+        "[class*='Close']",
+        "svg > path[d*='M19']",
         "button[aria-label='Close']",
         "[class*='dialog'] button:has-text('Later')",
         "[class*='modal'] button:has-text('Skip')",
@@ -735,12 +739,71 @@ async def _bms_capture_url(page, session_id: str) -> str:
     return url
 
 
+async def _bms_handle_contact_details(page, session_id: str, owner_email: str):
+    """
+    If we land on a ticket-options or intermediate checkout page requiring email/phone,
+    fill it out so we can reach the final payment page.
+    """
+    try:
+        await _human_delay(1.5, 3.0)
+        # Check if we are on a page where we need to input email and phone
+        email_inputs = await page.locator("input[type='email'], input[name*='email' i], input[placeholder*='Email' i]").all()
+        if email_inputs:
+            for inp in email_inputs:
+                if await inp.is_visible(timeout=1000):
+                    email_to_use = owner_email or "ankurvashishtha8535@gmail.com"
+                    await inp.fill(email_to_use)
+                    logger.info(f"[{session_id}] Filled email: {email_to_use}")
+                    break
+                    
+        phone_inputs = await page.locator("input[type='tel'], input[name*='phone' i], input[name*='mobile' i], input[placeholder*='Mobile' i]").all()
+        if phone_inputs:
+            for inp in phone_inputs:
+                if await inp.is_visible(timeout=1000):
+                    # Usually just the 10-digit number is required
+                    await inp.fill("8368272979")
+                    logger.info(f"[{session_id}] Filled phone number: 8368272979")
+                    break
+
+        # Check for T&C checkboxes that might need checking
+        checkboxes = await page.locator("input[type='checkbox'], [class*='checkbox']").all()
+        for cb in checkboxes:
+            try:
+                if await cb.is_visible(timeout=500):
+                    if not await cb.is_checked():
+                        await _human_click(page, cb)
+            except Exception:
+                pass
+        
+        # Look for buttons to submit contact details or Proceed to Pay
+        proceed_selectors = [
+            "button:has-text('Proceed to Pay')",
+            "button:has-text('Proceed')",
+            "button:has-text('Submit')",
+            "button:has-text('Continue')",
+            "a:has-text('Proceed to Pay')",
+            "[class*='proceed-btn']",
+            "button:has-text('Update Details')"
+        ]
+        
+        clicked = await _try_click_first(page, proceed_selectors, timeout=2000)
+        if clicked:
+            logger.info(f"[{session_id}] Clicked Proceed on contact details page")
+            try:
+                await page.wait_for_load_state("networkidle", timeout=6_000)
+            except Exception:
+                pass
+            
+    except Exception as e:
+        logger.warning(f"[{session_id}] Contact details handling issue: {e}")
+
 async def _run_bms_cart(page, session_id: str, target_price: str,
-                        watcher_id: str, max_qty: int = DEFAULT_MAX_QTY) -> str:
+                        watcher_id: str, max_qty: int = DEFAULT_MAX_QTY,
+                        owner_email: str = "") -> str:
     """
     Complete BookMyShow cart flow:
       popups → qty(max) → continue → category(cheapest) → subsection
-      → seats(max) → WAIT FOR SEAT LOCK → Book → capture cart URL
+      → seats(max) → WAIT FOR SEAT LOCK → Book → capture cart URL forms
     """
     await _bms_handle_popups(page, session_id)
     await _bms_select_quantity(page, session_id, max_qty)
@@ -771,6 +834,15 @@ async def _run_bms_cart(page, session_id: str, target_price: str,
         try:
             # FORCE Playwright to wait for the actual checkout page to load
             await page.wait_for_url("**/*checkout*", timeout=15_000)
+            await page.wait_for_load_state("networkidle", timeout=5_000)
+        except Exception:
+            pass
+
+        # Try to handle contact details after clicking Book
+        await _bms_handle_contact_details(page, session_id, owner_email)
+        
+        # In case there's another proceed jump (e.g. order-summary confirmation)
+        try:
             await page.wait_for_load_state("networkidle", timeout=5_000)
         except Exception:
             pass
@@ -1239,7 +1311,8 @@ def _derive_buytickets_url(event_url: str) -> str:
 # ═════════════════════════════════════════════════════════════════════════════
 
 async def _run_cart(session_id: str, checkout_url: str, target_price: str,
-                    watcher_id: str, max_qty: int = DEFAULT_MAX_QTY):
+                    watcher_id: str, max_qty: int = DEFAULT_MAX_QTY,
+                    owner_email: str = ""):
     """
     Core cart coroutine — runs inside the worker thread's event loop.
     Opens stealth Chromium via residential proxy, adds cheapest tier + max
@@ -1352,17 +1425,25 @@ async def _run_cart(session_id: str, checkout_url: str, target_price: str,
             is_district = "district.in" in checkout_url.lower()
 
             # ── Cart flow ────────────────────────────────────────────────
-            if is_bms:
-                cart_url = await _run_bms_cart(
-                    page, session_id, target_price, watcher_id, max_qty
-                )
-            elif is_district:
-                cart_url = await _run_district_cart(
-                    page, session_id, target_price, watcher_id, max_qty,
-                    checkout_url=checkout_url,
-                )
-            else:
-                cart_url = page.url
+            cart_url = ""
+            cart_error = None
+            try:
+                if is_bms:
+                    cart_url = await _run_bms_cart(
+                        page, session_id, target_price, watcher_id, max_qty,
+                        owner_email=owner_email
+                    )
+                elif is_district:
+                    cart_url = await _run_district_cart(
+                        page, session_id, target_price, watcher_id, max_qty,
+                        checkout_url=checkout_url,
+                    )
+                else:
+                    cart_url = page.url
+            except Exception as e:
+                cart_error = str(e)[:200]
+                logger.error(f"[{session_id}] Cart flow crashed: {e}")
+                # fall through — we STILL want to capture cookies
 
             # Strict validation — reject /cinemas, /movies, /home, root, etc.
             if not _is_useful_cart_url(cart_url):
@@ -1374,29 +1455,23 @@ async def _run_cart(session_id: str, checkout_url: str, target_price: str,
                 cart_url = better_url
 
             # ── Extract session cookies (the "VIP wristband") ─────────────
-            # So the user can paste them into Cookie-Editor and resume the
-            # bot's session directly — bypassing the redirect-to-/cinemas
-            # problem where the website kicks the user out for lacking the
-            # session token the bot holds.
-            cookie_payload = {"raw": [], "editthiscookie": [], "ok": False}
-            try:
-                raw_cookies = await ctx.cookies()
-                cookie_payload["raw"] = raw_cookies
-                cookie_payload["editthiscookie"] = _to_editthiscookie_format(
-                    raw_cookies
-                )
-                cookie_payload["ok"] = len(raw_cookies) > 0
-                logger.info(
-                    f"[{session_id}] Captured {len(raw_cookies)} cookies "
-                    f"(VIP wristband ready for transfer)"
-                )
-            except Exception as e:
-                logger.warning(f"[{session_id}] Cookie capture failed: {e}")
+            # ALWAYS runs — even if the cart flow crashed or selected 0 seats.
+            # The BMS/District session cookies (Akamai _abck, bm_sz, etc.) are
+            # still valuable for the user to paste into Cookie-Editor so the
+            # website recognizes their browser as "the one that passed bot
+            # verification" and doesn't redirect them to /cinemas.
+            cookie_payload = await _capture_cookies_safely(ctx, session_id)
 
-            _update(session_id, status="cart_ready",
-                    message="Cart ready — tap Open Cart, or Copy Session to paste in Cookie-Editor.",
-                    cart_url=cart_url,
-                    cart_cookies=cookie_payload)
+            if cart_error:
+                _update(session_id, status="cart_ready",
+                        message=f"Partial — cart build hit an issue, but session cookies were captured. {cart_error}",
+                        cart_url=cart_url,
+                        cart_cookies=cookie_payload)
+            else:
+                _update(session_id, status="cart_ready",
+                        message="Cart ready — tap Open Cart, or Copy Session to paste in Cookie-Editor.",
+                        cart_url=cart_url,
+                        cart_cookies=cookie_payload)
             logger.info(f"[{session_id}] Cart URL: {cart_url}")
 
             if watcher_id:
@@ -1405,7 +1480,18 @@ async def _run_cart(session_id: str, checkout_url: str, target_price: str,
 
         except Exception as e:
             logger.error(f"[{session_id}] Cart error: {e}")
-            _update(session_id, status="failed", message=str(e)[:200])
+            # Last-ditch: try to capture cookies even here
+            try:
+                cookie_payload = await _capture_cookies_safely(ctx, session_id)
+            except Exception:
+                cookie_payload = {"raw": [], "editthiscookie": [], "ok": False}
+            fallback_url = _derive_buytickets_url(checkout_url)
+            _update(session_id, status="cart_ready",
+                    message=f"Cart flow failed, but cookies saved: {str(e)[:120]}",
+                    cart_url=fallback_url,
+                    cart_cookies=cookie_payload)
+            if watcher_id:
+                _notify_cart_ready(watcher_id, fallback_url, cookie_payload)
         finally:
             await ctx.close()
             await browser.close()
@@ -1437,6 +1523,20 @@ _VALID_CART_TOKENS = (
     "buytickets", "cart", "checkout", "payment", "order",
     "ticket-options", "seat-layout", "booking", "book-now", "/ET",
 )
+
+
+async def _capture_cookies_safely(ctx, session_id: str) -> dict:
+    """Capture Playwright session cookies safely."""
+    try:
+        raw = await ctx.cookies()
+        return {
+            "raw": raw,
+            "editthiscookie": _to_editthiscookie_format(raw),
+            "ok": True
+        }
+    except Exception as e:
+        logger.error(f"[{session_id}] cookie capture failed: {e}")
+        return {"raw": [], "editthiscookie": [], "ok": False}
 
 
 def _to_editthiscookie_format(raw_cookies: list) -> list:
@@ -1577,6 +1677,7 @@ def _worker_main():
                         target_price=job.target_price,
                         watcher_id=job.watcher_id,
                         max_qty=job.max_qty,
+                        owner_email=job.owner_email,
                     )
                 )
             else:

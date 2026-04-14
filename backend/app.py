@@ -710,6 +710,28 @@ def check_now(watcher_id):
         save_data(data)
         return jsonify(watcher)
 
+@app.route("/api/watchers/<watcher_id>/build-cart", methods=["POST"])
+def build_cart(watcher_id):
+    if not _validate_watcher_id(watcher_id):
+        return jsonify({"error": "Invalid watcher ID"}), 400
+    with _data_lock:
+        data = load_data()
+        watcher = next((w for w in data["watchers"] if w["id"] == watcher_id), None)
+        if not watcher:
+            return jsonify({"error": "Not found"}), 404
+        if not _owns_watcher(watcher):
+            return jsonify({"error": "Not authorized"}), 403
+
+    checkout_url = watcher.get("checkout_url") or _derive_checkout_url(watcher["url"])
+    trigger_auto_checkout(
+        watcher["id"], checkout_url,
+        target_price=watcher.get("target_price", ""),
+        max_qty=int(watcher.get("max_qty", 10) or 10),
+        owner_email=watcher.get("owner", ""),
+    )
+    return jsonify({"ok": True, "message": "Manual cart build triggered asynchronously."})
+
+
 @app.route("/api/test-notification", methods=["POST"])
 def test_notification():
     sub_info = request.json.get("subscription")

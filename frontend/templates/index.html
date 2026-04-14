@@ -1177,6 +1177,7 @@
         </div>
       </div>
       <div class="watcher-actions">
+        <button class="icon-btn" title="Build Cart Now" onclick="buildCart('${w.id}')">🛒</button>
         <button class="icon-btn" title="Check now" onclick="checkNow('${w.id}')">⚡</button>
         <button class="icon-btn pause" title="${w.paused ? 'Resume' : 'Pause'}" onclick="togglePause('${w.id}')">
           ${w.paused ? '▶' : '⏸'}
@@ -1269,6 +1270,25 @@
     const data = await res.json();
     showToast(data.paused ? '⏸ Paused' : '▶ Resumed');
     await loadWatchers();
+  }
+
+  async function buildCart(id) {
+    const card = document.getElementById(`card-${id}`);
+    if (card) card.style.opacity = '0.6';
+    showToast('Triggering cart build…');
+    try {
+      const res = await fetch(`/api/watchers/${id}/build-cart`, { method: 'POST' });
+      const data = await res.json();
+      if (!res.ok) throw new Error(data.error || 'Failed');
+      
+      const w = watchers.find(x => x.id === id);
+      if (w) {
+        showAlertBanner(resolveWatcherTargetUrl(w), `${w.name} - Triggered manual cart build... standby`, id, { awaitCart: true });
+      }
+    } catch (e) {
+      if (card) card.style.opacity = '1';
+      showToast('Build cart failed: ' + e.message, 'error');
+    }
   }
 
   async function checkNow(id, { silent = false } = {}) {
