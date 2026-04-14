@@ -1669,29 +1669,19 @@ def _worker_main():
             sid = _session_id(job.watcher_id)
             has_proxy = all([PROXY_SERVER, PROXY_USERNAME, PROXY_PASSWORD])
 
-            if has_proxy:
-                # Full Playwright cart flow with stealth + proxy
-                loop.run_until_complete(
-                    _run_cart(
-                        sid, job.checkout_url,
-                        target_price=job.target_price,
-                        watcher_id=job.watcher_id,
-                        max_qty=job.max_qty,
-                        owner_email=job.owner_email,
-                    )
+            if not has_proxy:
+                logger.warning(f"[{sid}] No proxy configured — running cart flow from local IP. This may trigger Akamai blocks.")
+
+            # Full Playwright cart flow with stealth (+ optional proxy)
+            loop.run_until_complete(
+                _run_cart(
+                    sid, job.checkout_url,
+                    target_price=job.target_price,
+                    watcher_id=job.watcher_id,
+                    max_qty=job.max_qty,
+                    owner_email=job.owner_email,
                 )
-            else:
-                # No proxy → instant URL derivation fallback
-                cart_url = _derive_buytickets_url(job.checkout_url)
-                logger.info(f"[{sid}] No proxy — instant URL: {cart_url}")
-                with _sessions_lock:
-                    if sid in _sessions:
-                        _sessions[sid].update({
-                            "status":   "cart_ready",
-                            "message":  "Booking link ready — open and select seats!",
-                            "cart_url": cart_url,
-                        })
-                _notify_cart_ready(job.watcher_id, cart_url)
+            )
 
             _job_queue.task_done()
 
