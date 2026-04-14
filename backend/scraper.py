@@ -415,11 +415,10 @@ async def _fetch_with_playwright(url: str) -> Optional[str]:
         return None
 
     # Import stealth patcher (playwright-stealth v2.x)
-    _stealth_cls = None
+    stealth_async = None
     try:
-        from playwright_stealth import Stealth
-        _stealth_cls = Stealth
-    except Exception:
+        from playwright_stealth import stealth_async
+    except ImportError:
         pass
 
     ua = random.choice(USER_AGENTS)
@@ -452,18 +451,19 @@ async def _fetch_with_playwright(url: str) -> Optional[str]:
             ctx_kwargs["proxy"] = proxy
 
         context = await browser.new_context(**ctx_kwargs)
+        page = await context.new_page()
 
-        # ── Apply stealth patches to context ─────────────────────────
+        # ── Apply stealth patches to page ─────────────────────────
         stealth_applied = False
-        if _stealth_cls:
+        if stealth_async:
             try:
-                await _stealth_cls().apply_stealth_async(context)
+                await stealth_async(page)
                 stealth_applied = True
-            except Exception:
-                pass
+            except Exception as e:
+                logger.warning(f"Failed to apply stealth: {e}")
 
         if not stealth_applied:
-            await context.add_init_script("""
+            await page.add_init_script("""
                 Object.defineProperty(navigator,'webdriver',{get:()=>undefined});
                 try{delete navigator.__proto__.webdriver}catch(e){}
                 Object.defineProperty(navigator,'plugins',{
@@ -478,8 +478,6 @@ async def _fetch_with_playwright(url: str) -> Optional[str]:
                 window.chrome={runtime:{connect:()=>{},sendMessage:()=>{}},
                     loadTimes:()=>({}),csi:()=>({})};
             """)
-
-        page = await context.new_page()
 
         try:
             # Small random delay before navigation
